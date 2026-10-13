@@ -16,10 +16,11 @@ use agent_ui::threads_archive_view::{
     fuzzy_match_positions,
 };
 use agent_ui::{
-    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
-    ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
-    ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
+    AcpThreadImportOnboarding, Agent, AgentNotification, AgentNotificationEvent, AgentPanel,
+    AgentPanelEvent, AgentThreadSource, ArchiveSelectedThread, CrossChannelImportOnboarding,
+    DEFAULT_THREAD_TITLE, NewTerminalThread, NewThread, RenameSelectedThread, TerminalId, ThreadId,
+    ThreadImportModal, ThreadTitleRegenerationResult, channels_with_threads,
+    import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
@@ -48,13 +49,15 @@ use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::utils::platform_title_bar_height;
 
 use serde::{Deserialize, Serialize};
-use settings::{Settings as _, SettingsStore};
+use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use terminal::Event as TerminalEvent;
+use terminal_view::{ResumableCliProvider, TerminalView};
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
@@ -69,7 +72,8 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace, item::ItemEvent, notifications::NotificationId,
+    sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -351,6 +355,179 @@ enum DraftKind {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CenterAgentKind {
+    Codex,
+    Claude,
+    Copilot,
+    Hermes,
+}
+
+impl CenterAgentKind {
+    fn from_command(command: &str) -> Option<Self> {
+        let command = Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(command);
+        let command = command
+            .strip_suffix(".exe")
+            .or_else(|| command.strip_suffix(".EXE"))
+            .unwrap_or(command);
+
+        if command.eq_ignore_ascii_case("codex") {
+            Some(Self::Codex)
+        } else if command.eq_ignore_ascii_case("claude") {
+            Some(Self::Claude)
+        } else if command.eq_ignore_ascii_case("copilot") {
+            Some(Self::Copilot)
+        } else if command.eq_ignore_ascii_case("hermes") {
+            Some(Self::Hermes)
+        } else {
+            None
+        }
+    }
+
+    fn from_provider(provider: ResumableCliProvider) -> Self {
+        match provider {
+            ResumableCliProvider::Codex => Self::Codex,
+            ResumableCliProvider::Claude => Self::Claude,
+            ResumableCliProvider::Copilot => Self::Copilot,
+            ResumableCliProvider::Hermes => Self::Hermes,
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Codex => IconName::AiOpenAi,
+            Self::Claude => IconName::AiClaude,
+            Self::Copilot => IconName::Copilot,
+            Self::Hermes => IconName::Terminal,
+        }
+    }
+
+    fn title_prefix(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Copilot => "copilot",
+            Self::Hermes => "hermes",
+        }
+    }
+}
+
+fn next_center_agent_terminal_title<'a>(
+    kind: CenterAgentKind,
+    titles: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let prefix = kind.title_prefix();
+    let next_number = titles
+        .into_iter()
+        .filter_map(|title| {
+            let (title_prefix, number) = title.rsplit_once('-')?;
+            title_prefix
+                .eq_ignore_ascii_case(prefix)
+                .then(|| number.parse::<u64>().ok())
+                .flatten()
+                .filter(|number| *number > 0)
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+
+    format!("{prefix}-{next_number}")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CenterTerminalPresentation {
+    kind: CenterAgentKind,
+    title: SharedString,
+    custom_title: Option<SharedString>,
+    working_directory: Option<PathBuf>,
+    project_worktree_root: Option<PathBuf>,
+}
+
+fn center_terminal_presentation(
+    terminal_view: &Entity<TerminalView>,
+    cx: &App,
+) -> Option<CenterTerminalPresentation> {
+    let structured_kind = terminal_view
+        .read(cx)
+        .active_resumable_cli_provider()
+        .map(CenterAgentKind::from_provider);
+    let terminal = terminal_view.read(cx).terminal().clone();
+    let (kind, title, working_directory) = terminal.read_with(cx, |terminal, _cx| {
+        let kind = structured_kind.or_else(|| {
+            terminal
+                .foreground_process_command_name()
+                .as_deref()
+                .and_then(CenterAgentKind::from_command)
+        })?;
+        Some((kind, terminal.title(true), terminal.working_directory()))
+    })?;
+
+    Some(CenterTerminalPresentation {
+        kind,
+        title: title.into(),
+        custom_title: terminal_view
+            .read(cx)
+            .custom_title()
+            .map(|title| SharedString::from(title.to_owned())),
+        working_directory,
+        project_worktree_root: terminal_view.read(cx).project_worktree_root(cx),
+    })
+}
+
+fn matching_center_terminal_worktree<'a>(
+    root: Option<&Path>,
+    worktree_roots: &'a [(PathBuf, PathBuf, ProjectGroupKey)],
+) -> Option<&'a (PathBuf, PathBuf, ProjectGroupKey)> {
+    let root = root?;
+    worktree_roots
+        .iter()
+        .find(|(_, folder, _)| root == folder.as_path())
+}
+
+struct CenterTerminalRecord {
+    terminal_id: TerminalId,
+    created_at: DateTime<Utc>,
+    workspace: WeakEntity<Workspace>,
+    terminal_view: WeakEntity<TerminalView>,
+    presentation: Option<CenterTerminalPresentation>,
+    auto_title: Option<SharedString>,
+    has_notification: bool,
+    notification_windows: Vec<WindowHandle<AgentNotification>>,
+    notification_subscriptions: Vec<gpui::Subscription>,
+}
+
+fn update_center_terminal_presentation(
+    current: &mut Option<CenterTerminalPresentation>,
+    presentation: Option<CenterTerminalPresentation>,
+) -> bool {
+    if *current == presentation {
+        false
+    } else {
+        *current = presentation;
+        true
+    }
+}
+
+fn mark_center_terminal_attention(
+    has_presentation: bool,
+    has_notification: &mut bool,
+    terminal_visible: bool,
+) -> bool {
+    if has_presentation && !*has_notification && !terminal_visible {
+        *has_notification = true;
+        true
+    } else {
+        false
+    }
+}
+
+fn clear_center_terminal_attention(has_notification: &mut bool) -> bool {
+    std::mem::replace(has_notification, false)
+}
+
 #[derive(Clone)]
 struct ThreadEntry {
     metadata: ThreadMetadata,
@@ -372,6 +549,8 @@ struct TerminalEntry {
     metadata: TerminalThreadMetadata,
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
+    icon: IconName,
+    center_view: Option<WeakEntity<TerminalView>>,
     has_notification: bool,
     highlight_positions: Vec<usize>,
 }
@@ -399,6 +578,7 @@ enum ListEntry {
     ProjectHeader {
         key: ProjectGroupKey,
         label: SharedString,
+        is_synthetic: bool,
         highlight_positions: Vec<usize>,
         has_running_threads: bool,
         waiting_thread_count: usize,
@@ -434,13 +614,8 @@ impl RenameTarget {
 
 #[derive(Clone)]
 enum ActivatableEntry {
-    Thread {
-        metadata: ThreadMetadata,
-    },
-    Terminal {
-        metadata: TerminalThreadMetadata,
-        workspace: ThreadEntryWorkspace,
-    },
+    Thread { metadata: ThreadMetadata },
+    Terminal(TerminalEntry),
 }
 
 impl ActivatableEntry {
@@ -449,10 +624,7 @@ impl ActivatableEntry {
             ListEntry::Thread(thread) => Some(Self::Thread {
                 metadata: thread.metadata.clone(),
             }),
-            ListEntry::Terminal(terminal) => Some(Self::Terminal {
-                metadata: terminal.metadata.clone(),
-                workspace: terminal.workspace.clone(),
-            }),
+            ListEntry::Terminal(terminal) => Some(Self::Terminal(terminal.clone())),
             ListEntry::ProjectHeader { .. } => None,
         }
     }
@@ -823,6 +995,8 @@ pub struct Sidebar {
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
+    center_terminal_records: HashMap<EntityId, CenterTerminalRecord>,
+    center_terminal_subscriptions: HashMap<EntityId, Vec<gpui::Subscription>>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -974,6 +1148,8 @@ impl Sidebar {
             project_header_new_thread_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
+            center_terminal_records: HashMap::new(),
+            center_terminal_subscriptions: HashMap::new(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1066,13 +1242,29 @@ impl Sidebar {
         cx.subscribe_in(
             workspace,
             window,
-            move |this, workspace, event: &workspace::Event, window, cx| {
-                if let workspace::Event::PanelAdded(view) = event {
+            move |this, workspace, event: &workspace::Event, window, cx| match event {
+                workspace::Event::PanelAdded(view) => {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
                     }
                 }
+                workspace::Event::ItemAdded { item } => {
+                    if let Some(terminal_view) = item.downcast::<TerminalView>() {
+                        this.subscribe_to_center_terminal(workspace, &terminal_view, window, cx);
+                        this.schedule_update_entries(false, cx);
+                    }
+                }
+                workspace::Event::ActiveItemChanged
+                | workspace::Event::ZoomChanged
+                | workspace::Event::Activate => {
+                    this.dismiss_visible_center_terminal_notifications(workspace, window, cx);
+                }
+                workspace::Event::ItemRemoved { item_id } => {
+                    this.remove_center_terminal(*item_id, cx);
+                    this.schedule_update_entries(false, cx);
+                }
+                _ => {}
             },
         )
         .detach();
@@ -1082,6 +1274,438 @@ impl Sidebar {
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
         }
+
+        let center_terminals: Vec<_> = workspace
+            .read(cx)
+            .panes()
+            .iter()
+            .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+            .collect();
+        for terminal_view in center_terminals {
+            self.subscribe_to_center_terminal(workspace, &terminal_view, window, cx);
+        }
+    }
+
+    fn subscribe_to_center_terminal(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        terminal_view: &Entity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let item_id = terminal_view.entity_id();
+        if self.center_terminal_subscriptions.contains_key(&item_id) {
+            return;
+        }
+
+        self.center_terminal_records
+            .entry(item_id)
+            .or_insert_with(|| CenterTerminalRecord {
+                terminal_id: TerminalId::new(),
+                created_at: Utc::now(),
+                workspace: workspace.downgrade(),
+                terminal_view: terminal_view.downgrade(),
+                presentation: center_terminal_presentation(terminal_view, cx),
+                auto_title: None,
+                has_notification: false,
+                notification_windows: Vec::new(),
+                notification_subscriptions: Vec::new(),
+            });
+        let workspace = workspace.downgrade();
+        let bell_workspace = workspace.clone();
+        let presentation_subscription = cx.subscribe_in(
+            terminal_view,
+            window,
+            move |this, terminal_view, event: &ItemEvent, window, cx| {
+                if matches!(event, ItemEvent::UpdateTab) {
+                    let item_id = terminal_view.entity_id();
+                    let presentation = center_terminal_presentation(&terminal_view, cx);
+                    let custom_title = terminal_view
+                        .read(cx)
+                        .custom_title()
+                        .map(SharedString::from);
+                    let mut kind_to_name = None;
+                    let mut became_recognized = false;
+                    let changed =
+                        this.center_terminal_records
+                            .get_mut(&item_id)
+                            .is_some_and(|record| {
+                                let previous_kind =
+                                    record.presentation.as_ref().map(|value| value.kind);
+                                if let Some(auto_title) = record.auto_title.as_ref()
+                                    && custom_title.as_ref() != Some(auto_title)
+                                {
+                                    record.auto_title = None;
+                                }
+                                let current_kind = presentation.as_ref().map(|value| value.kind);
+                                became_recognized =
+                                    previous_kind.is_none() && current_kind.is_some();
+                                if previous_kind.is_none()
+                                    && let Some(kind) = current_kind
+                                    && presentation
+                                        .as_ref()
+                                        .is_some_and(|value| value.custom_title.is_none())
+                                {
+                                    kind_to_name = Some(kind);
+                                }
+                                update_center_terminal_presentation(
+                                    &mut record.presentation,
+                                    presentation,
+                                )
+                            });
+
+                    if let Some(kind) = kind_to_name
+                        && let Some(workspace) = workspace.upgrade()
+                    {
+                        let titles = workspace
+                            .read(cx)
+                            .panes()
+                            .iter()
+                            .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                            .filter_map(|view| view.read(cx).custom_title().map(str::to_owned))
+                            .collect::<Vec<_>>();
+                        let title = next_center_agent_terminal_title(
+                            kind,
+                            titles.iter().map(String::as_str),
+                        );
+                        if let Some(record) = this.center_terminal_records.get_mut(&item_id) {
+                            record.auto_title = Some(title.clone().into());
+                        }
+                        terminal_view.update(cx, |terminal_view, cx| {
+                            terminal_view.set_custom_title(Some(title), cx);
+                        });
+                    }
+                    if changed {
+                        this.schedule_update_entries(false, cx);
+                        if became_recognized && terminal_view.read(cx).has_bell() {
+                            this.mark_center_terminal_notification(
+                                item_id,
+                                &workspace,
+                                &terminal_view.downgrade(),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
+            },
+        );
+        let acknowledgment_subscription = cx.subscribe(
+            terminal_view,
+            move |this, _, _: &terminal_view::BellAcknowledged, cx| {
+                this.clear_center_terminal_notification(item_id, cx);
+            },
+        );
+        let terminal = terminal_view.read(cx).terminal().clone();
+        let terminal_view = terminal_view.downgrade();
+        let bell_subscription = cx.subscribe_in(
+            &terminal,
+            window,
+            move |this, _, event: &TerminalEvent, window, cx| {
+                if matches!(event, TerminalEvent::Bell) {
+                    this.mark_center_terminal_notification(
+                        item_id,
+                        &bell_workspace,
+                        &terminal_view,
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
+        self.center_terminal_subscriptions.insert(
+            item_id,
+            vec![
+                presentation_subscription,
+                bell_subscription,
+                acknowledgment_subscription,
+            ],
+        );
+    }
+
+    fn mark_center_terminal_notification(
+        &mut self,
+        item_id: EntityId,
+        workspace: &WeakEntity<Workspace>,
+        terminal_view: &WeakEntity<TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(workspace), Some(terminal_view)) = (workspace.upgrade(), terminal_view.upgrade())
+        else {
+            return;
+        };
+        let terminal_visible = self.center_terminal_visible(&workspace, &terminal_view, window, cx);
+        let newly_notified = self
+            .center_terminal_records
+            .get_mut(&item_id)
+            .is_some_and(|record| {
+                mark_center_terminal_attention(
+                    record.presentation.is_some(),
+                    &mut record.has_notification,
+                    terminal_visible,
+                )
+            });
+        if newly_notified {
+            self.schedule_update_entries(false, cx);
+            self.show_center_terminal_notification(item_id, window, cx);
+        }
+    }
+
+    fn center_terminal_visible(
+        &self,
+        workspace: &Entity<Workspace>,
+        terminal_view: &Entity<TerminalView>,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        if !window.is_window_active() {
+            return false;
+        }
+        if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten()
+            && multi_workspace.read(cx).workspace() != workspace
+        {
+            return false;
+        }
+        let workspace = workspace.read(cx);
+        workspace.panes().iter().any(|pane| {
+            (!workspace.is_pane_maximized() || workspace.active_pane() == pane)
+                && workspace
+                    .zoomed_item()
+                    .is_none_or(|zoomed| zoomed == &pane.downgrade().into())
+                && pane
+                    .read(cx)
+                    .active_item()
+                    .is_some_and(|active| active.item_id() == terminal_view.entity_id())
+        })
+    }
+
+    fn center_terminal_status_visible(
+        &self,
+        workspace: &Entity<Workspace>,
+        terminal_view: &Entity<TerminalView>,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        if !window.is_window_active() {
+            return false;
+        }
+        if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
+            let multi_workspace = multi_workspace.read(cx);
+            if multi_workspace.sidebar_open() && self.is_threads_list_view_active() {
+                return true;
+            }
+        }
+        self.center_terminal_visible(workspace, terminal_view, window, cx)
+    }
+
+    fn show_center_terminal_notification(
+        &mut self,
+        item_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.center_terminal_records.get(&item_id) else {
+            return;
+        };
+        if !record.notification_windows.is_empty() {
+            return;
+        }
+        let (Some(workspace), Some(terminal_view), Some(presentation)) = (
+            record.workspace.upgrade(),
+            record.terminal_view.upgrade(),
+            record.presentation.as_ref(),
+        ) else {
+            return;
+        };
+        if self.center_terminal_status_visible(&workspace, &terminal_view, window, cx) {
+            return;
+        }
+        let title = presentation
+            .custom_title
+            .clone()
+            .unwrap_or_else(|| presentation.title.clone());
+        let project_name = workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| SharedString::from(worktree.read(cx).root_name_str().to_string()));
+        let displays: Vec<Rc<dyn gpui::PlatformDisplay>> =
+            match AgentSettings::get_global(cx).notify_when_agent_waiting {
+                NotifyWhenAgentWaiting::PrimaryScreen => cx.primary_display().into_iter().collect(),
+                NotifyWhenAgentWaiting::AllScreens => cx.displays(),
+                NotifyWhenAgentWaiting::Never => return,
+            };
+        window.request_attention();
+        for display in displays {
+            self.pop_up_center_terminal_notification(
+                item_id,
+                title.clone(),
+                project_name.clone(),
+                display,
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn pop_up_center_terminal_notification(
+        &mut self,
+        item_id: EntityId,
+        title: SharedString,
+        project_name: Option<SharedString>,
+        display: Rc<dyn gpui::PlatformDisplay>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let options = AgentNotification::window_options(display, cx);
+        let Ok(notification_window) = cx.open_window(options, |_window, cx| {
+            cx.new(|_cx| AgentNotification::new(title, None, IconName::Terminal, project_name))
+        }) else {
+            return;
+        };
+        let Ok(notification) = notification_window.entity(cx) else {
+            return;
+        };
+        let event_subscription = cx.subscribe_in(
+            &notification,
+            window,
+            move |this, _, event: &AgentNotificationEvent, window, cx| {
+                if matches!(event, AgentNotificationEvent::Accepted) {
+                    this.activate_center_terminal(item_id, window, cx);
+                }
+                this.clear_center_terminal_notification(item_id, cx);
+            },
+        );
+        let window_activation_subscription = cx.observe_window_activation(window, {
+            move |this, window, cx| {
+                this.dismiss_center_terminal_popup_if_visible(item_id, window, cx);
+            }
+        });
+        let multi_workspace_subscription = window.root::<MultiWorkspace>().flatten().map(|root| {
+            cx.observe_in(&root, window, move |this, _, window, cx| {
+                this.dismiss_center_terminal_popup_if_visible(item_id, window, cx);
+            })
+        });
+        let Some(record) = self.center_terminal_records.get_mut(&item_id) else {
+            notification_window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+            return;
+        };
+        record.notification_windows.push(notification_window);
+        record.notification_subscriptions.push(event_subscription);
+        record
+            .notification_subscriptions
+            .push(window_activation_subscription);
+        if let Some(subscription) = multi_workspace_subscription {
+            record.notification_subscriptions.push(subscription);
+        }
+    }
+
+    fn dismiss_center_terminal_popup_if_visible(
+        &mut self,
+        item_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.center_terminal_records.get(&item_id) else {
+            return;
+        };
+        let (Some(workspace), Some(terminal_view)) =
+            (record.workspace.upgrade(), record.terminal_view.upgrade())
+        else {
+            return;
+        };
+        if !self.center_terminal_status_visible(&workspace, &terminal_view, window, cx) {
+            return;
+        }
+        if self.center_terminal_visible(&workspace, &terminal_view, window, cx) {
+            self.clear_center_terminal_notification(item_id, cx);
+        } else {
+            self.dismiss_center_terminal_popup(item_id, cx);
+        }
+    }
+
+    fn dismiss_visible_center_terminal_notifications(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible_item_ids = self
+            .center_terminal_records
+            .iter()
+            .filter_map(|(item_id, record)| {
+                let record_workspace = record.workspace.upgrade()?;
+                let terminal_view = record.terminal_view.upgrade()?;
+                (record_workspace == *workspace
+                    && self.center_terminal_visible(workspace, &terminal_view, window, cx))
+                .then_some(*item_id)
+            })
+            .collect::<Vec<_>>();
+        for item_id in visible_item_ids {
+            self.clear_center_terminal_notification(item_id, cx);
+        }
+    }
+
+    fn dismiss_center_terminal_popup(&mut self, item_id: EntityId, cx: &mut Context<Self>) {
+        let Some(record) = self.center_terminal_records.get_mut(&item_id) else {
+            return;
+        };
+        let windows = std::mem::take(&mut record.notification_windows);
+        record.notification_subscriptions.clear();
+        for notification_window in windows {
+            notification_window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        }
+    }
+
+    fn clear_center_terminal_notification(&mut self, item_id: EntityId, cx: &mut Context<Self>) {
+        let changed = self
+            .center_terminal_records
+            .get_mut(&item_id)
+            .is_some_and(|record| clear_center_terminal_attention(&mut record.has_notification));
+        self.dismiss_center_terminal_popup(item_id, cx);
+        if changed {
+            self.schedule_update_entries(false, cx);
+        }
+    }
+
+    fn remove_center_terminal(&mut self, item_id: EntityId, cx: &mut Context<Self>) {
+        self.clear_center_terminal_notification(item_id, cx);
+        self.center_terminal_subscriptions.remove(&item_id);
+        self.center_terminal_records.remove(&item_id);
+    }
+
+    fn activate_center_terminal(
+        &mut self,
+        item_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.center_terminal_records.get(&item_id) else {
+            return;
+        };
+        let (Some(workspace), Some(terminal_view)) =
+            (record.workspace.upgrade(), record.terminal_view.upgrade())
+        else {
+            return;
+        };
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        cx.activate(true);
+        window.activate_window();
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace.clone(), None, window, cx);
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.activate_item(&terminal_view, true, true, window, cx);
+        });
     }
 
     fn move_entry_paths(
@@ -1495,6 +2119,106 @@ impl Sidebar {
             }
         }
 
+        let worktree_roots: Vec<(PathBuf, PathBuf, ProjectGroupKey)> = workspaces
+            .iter()
+            .flat_map(|workspace| {
+                let workspace = workspace.read(cx);
+                let project = workspace.project().read(cx);
+                let group_key = project.project_group_key(cx);
+                project
+                    .worktree_paths(cx)
+                    .ordered_pairs()
+                    .map(|(main, folder)| (main.clone(), folder.clone(), group_key.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut center_terminals_by_group: HashMap<ProjectGroupKey, Vec<TerminalEntry>> =
+            HashMap::new();
+        let mut no_worktree_terminals = Vec::new();
+        let mut current_center_item_ids = HashSet::new();
+        for workspace in &workspaces {
+            let terminal_views: Vec<_> = workspace
+                .read(cx)
+                .panes()
+                .iter()
+                .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                .collect();
+            for terminal_view in terminal_views {
+                let item_id = terminal_view.entity_id();
+                current_center_item_ids.insert(item_id);
+                let presentation = center_terminal_presentation(&terminal_view, cx);
+                let record = self
+                    .center_terminal_records
+                    .entry(item_id)
+                    .or_insert_with(|| CenterTerminalRecord {
+                        terminal_id: TerminalId::new(),
+                        created_at: Utc::now(),
+                        workspace: workspace.downgrade(),
+                        terminal_view: terminal_view.downgrade(),
+                        presentation: presentation.clone(),
+                        auto_title: None,
+                        has_notification: false,
+                        notification_windows: Vec::new(),
+                        notification_subscriptions: Vec::new(),
+                    });
+                record.presentation = presentation;
+                let Some(presentation) = record.presentation.as_ref() else {
+                    continue;
+                };
+                let matched_worktree = matching_center_terminal_worktree(
+                    presentation.project_worktree_root.as_deref(),
+                    &worktree_roots,
+                );
+                let (worktree_paths, group_key) =
+                    if let Some((main, folder, group_key)) = matched_worktree {
+                        (
+                            WorktreePaths::from_path_lists(
+                                PathList::new(std::slice::from_ref(main)),
+                                PathList::new(std::slice::from_ref(folder)),
+                            )
+                            .expect("single worktree path pair must be valid"),
+                            Some(group_key.clone()),
+                        )
+                    } else {
+                        (WorktreePaths::default(), None)
+                    };
+                let worktrees = worktree_info_from_thread_paths(&worktree_paths, &branch_by_path);
+                let entry = TerminalEntry {
+                    metadata: TerminalThreadMetadata {
+                        terminal_id: record.terminal_id,
+                        title: presentation.title.clone(),
+                        custom_title: presentation.custom_title.clone(),
+                        created_at: record.created_at,
+                        worktree_paths,
+                        remote_connection: workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .remote_connection_options(cx),
+                        working_directory: presentation.working_directory.clone(),
+                    },
+                    workspace: ThreadEntryWorkspace::Open(workspace.clone()),
+                    worktrees,
+                    icon: presentation.kind.icon(),
+                    center_view: Some(terminal_view.downgrade()),
+                    has_notification: record.has_notification,
+                    highlight_positions: Vec::new(),
+                };
+
+                if let Some(group_key) = group_key {
+                    center_terminals_by_group
+                        .entry(group_key)
+                        .or_default()
+                        .push(entry);
+                } else {
+                    no_worktree_terminals.push(entry);
+                }
+            }
+        }
+        self.center_terminal_records
+            .retain(|item_id, _| current_center_item_ids.contains(item_id));
+        self.center_terminal_subscriptions
+            .retain(|item_id, _| current_center_item_ids.contains(item_id));
         for group in &groups {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
@@ -1524,6 +2248,8 @@ impl Sidebar {
                         metadata,
                         workspace,
                         worktrees,
+                        icon: IconName::Terminal,
+                        center_view: None,
                         has_notification,
                         highlight_positions: Vec::new(),
                     }
@@ -1581,6 +2307,12 @@ impl Sidebar {
                             project_group_key: group_key.clone(),
                         },
                     );
+                }
+            }
+            if let Some(center_terminals) = center_terminals_by_group.remove(group_key) {
+                for terminal in center_terminals {
+                    seen_terminal_ids.insert(terminal.metadata.terminal_id);
+                    terminals.push(terminal);
                 }
             }
             current_terminal_ids.extend(
@@ -1944,6 +2676,7 @@ impl Sidebar {
                 entries.push(ListEntry::ProjectHeader {
                     key: group_key.clone(),
                     label,
+                    is_synthetic: false,
                     highlight_positions: workspace_highlight_positions,
                     has_running_threads,
                     waiting_thread_count,
@@ -1990,6 +2723,7 @@ impl Sidebar {
                 entries.push(ListEntry::ProjectHeader {
                     key: group_key.clone(),
                     label,
+                    is_synthetic: false,
                     highlight_positions: Vec::new(),
                     has_running_threads,
                     waiting_thread_count,
@@ -2006,6 +2740,53 @@ impl Sidebar {
                     &mut entries,
                     terminals,
                     threads,
+                    &mut current_session_ids,
+                    &mut current_thread_ids,
+                );
+            }
+        }
+
+        if !no_worktree_terminals.is_empty() {
+            let label: SharedString = "No Worktree".into();
+            let label_highlights = if query.is_empty() {
+                Vec::new()
+            } else {
+                fuzzy_match_positions(&query, &label).unwrap_or_default()
+            };
+            no_worktree_terminals.retain_mut(|terminal| {
+                if query.is_empty() || !label_highlights.is_empty() {
+                    return true;
+                }
+                let title = terminal.metadata.display_title();
+                if let Some(positions) = fuzzy_match_positions(&query, title.as_ref()) {
+                    terminal.highlight_positions = positions;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !no_worktree_terminals.is_empty() {
+                current_terminal_ids.extend(
+                    no_worktree_terminals
+                        .iter()
+                        .map(|terminal| terminal.metadata.terminal_id),
+                );
+                project_header_indices.push(entries.len());
+                entries.push(ListEntry::ProjectHeader {
+                    key: ProjectGroupKey::default(),
+                    label,
+                    is_synthetic: true,
+                    highlight_positions: label_highlights,
+                    has_running_threads: false,
+                    waiting_thread_count: 0,
+                    has_notifications: false,
+                    is_active: false,
+                    has_threads: true,
+                });
+                Self::push_entries_by_display_time(
+                    &mut entries,
+                    no_worktree_terminals,
+                    Vec::new(),
                     &mut current_session_ids,
                     &mut current_thread_ids,
                 );
@@ -2245,6 +3026,7 @@ impl Sidebar {
             ListEntry::ProjectHeader {
                 key,
                 label,
+                is_synthetic,
                 highlight_positions,
                 has_running_threads,
                 waiting_thread_count,
@@ -2252,6 +3034,9 @@ impl Sidebar {
                 is_active: is_active_group,
                 has_threads,
             } => {
+                if *is_synthetic {
+                    return self.render_section_header(ix, false, label, highlight_positions, cx);
+                }
                 self.project_header_menu_handles.entry(ix).or_default();
                 self.project_header_new_thread_menu_handles
                     .entry(ix)
@@ -2313,6 +3098,34 @@ impl Sidebar {
                 .tooltip(Tooltip::text("Remote Project"))
                 .into_any_element(),
         )
+    }
+
+    fn render_section_header(
+        &self,
+        ix: usize,
+        is_sticky: bool,
+        label: &SharedString,
+        highlight_positions: &[usize],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id_prefix = if is_sticky { "sticky-" } else { "" };
+        let label = if highlight_positions.is_empty() {
+            Label::new(label.clone())
+                .color(Color::Muted)
+                .into_any_element()
+        } else {
+            HighlightedLabel::new(label.clone(), highlight_positions.to_vec())
+                .color(Color::Muted)
+                .into_any_element()
+        };
+
+        h_flex()
+            .id(format!("{id_prefix}section-header-{ix}"))
+            .h(Tab::content_height(cx))
+            .w_full()
+            .px_2()
+            .child(label)
+            .into_any_element()
     }
 
     fn render_project_header(
@@ -2795,7 +3608,11 @@ impl Sidebar {
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                ListEntry::ProjectHeader {
+                    key,
+                    is_synthetic: false,
+                    ..
+                } => Some(key.clone()),
                 _ => None,
             })
             .collect();
@@ -3248,6 +4065,7 @@ impl Sidebar {
         let ListEntry::ProjectHeader {
             key,
             label,
+            is_synthetic,
             highlight_positions,
             has_running_threads,
             waiting_thread_count,
@@ -3261,6 +4079,16 @@ impl Sidebar {
 
         let is_focused = self.focus_handle.is_focused(window);
         let is_selected = is_focused && self.selection == Some(header_idx);
+
+        if *is_synthetic {
+            return Some(self.render_section_header(
+                header_idx,
+                true,
+                label,
+                highlight_positions,
+                cx,
+            ));
+        }
 
         let header_element = self.render_project_header(
             header_idx,
@@ -3534,6 +4362,32 @@ impl Sidebar {
         title: SharedString,
         cx: &mut Context<Self>,
     ) {
+        let center_view = self.contents.entries.iter().find_map(|entry| {
+            let ListEntry::Terminal(terminal) = entry else {
+                return None;
+            };
+            (terminal.metadata.terminal_id == terminal_id)
+                .then(|| terminal.center_view.clone())
+                .flatten()
+        });
+        if let Some(center_view) = center_view {
+            let Some(terminal_view) = center_view.upgrade() else {
+                self.schedule_update_entries(false, cx);
+                return;
+            };
+            let title = title.trim();
+            let terminal_title = terminal_view.read(cx).terminal().read(cx).title(true);
+            let custom_title = if title.is_empty() || title == terminal_title {
+                None
+            } else {
+                Some(title.to_string())
+            };
+            terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.set_custom_title(custom_title, cx);
+            });
+            return;
+        }
+
         let mut found = false;
         if let Some(multi_workspace) = self.multi_workspace.upgrade() {
             let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
@@ -3648,7 +4502,12 @@ impl Sidebar {
         };
 
         match entry {
-            ListEntry::ProjectHeader { key, .. } => {
+            ListEntry::ProjectHeader {
+                key, is_synthetic, ..
+            } => {
+                if *is_synthetic {
+                    return;
+                }
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
             }
@@ -3676,9 +4535,7 @@ impl Sidebar {
                 }
             }
             ListEntry::Terminal(terminal) => {
-                let metadata = terminal.metadata.clone();
-                let workspace = terminal.workspace.clone();
-                self.activate_terminal_entry(metadata, workspace, false, window, cx);
+                self.activate_terminal_entry(terminal.clone(), false, window, cx);
             }
         }
     }
@@ -3750,6 +4607,28 @@ impl Sidebar {
         });
 
         if let Some(agent_panel) = existing_panel {
+            if let Some(item) = agent_panel.read(cx).center_thread_item(metadata.thread_id) {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(&item, true, focus, window, cx);
+                });
+                return;
+            }
+            if agent_panel
+                .read(cx)
+                .prefers_center_thread(metadata.thread_id)
+            {
+                workspace.update(cx, |workspace, cx| {
+                    agent_ui::ThreadItem::open(
+                        workspace,
+                        Agent::from(metadata.agent_id.clone()),
+                        Some(metadata.thread_id),
+                        focus,
+                        window,
+                        cx,
+                    );
+                });
+                return;
+            }
             load_thread(agent_panel, metadata, focus, window, cx);
             workspace.update(cx, |workspace, cx| {
                 if focus {
@@ -4379,7 +5258,12 @@ impl Sidebar {
         let Some(ix) = self.selection else { return };
 
         match self.contents.entries.get(ix) {
-            Some(ListEntry::ProjectHeader { key, .. }) => {
+            Some(ListEntry::ProjectHeader {
+                key, is_synthetic, ..
+            }) => {
+                if *is_synthetic {
+                    return;
+                }
                 let key = key.clone();
                 if self.is_group_collapsed(&key, cx) {
                     self.set_group_expanded(&key, true, cx);
@@ -4403,7 +5287,12 @@ impl Sidebar {
         let Some(ix) = self.selection else { return };
 
         match self.contents.entries.get(ix) {
-            Some(ListEntry::ProjectHeader { key, .. }) => {
+            Some(ListEntry::ProjectHeader {
+                key, is_synthetic, ..
+            }) => {
+                if *is_synthetic {
+                    return;
+                }
                 let key = key.clone();
                 if !self.is_group_collapsed(&key, cx) {
                     self.set_group_expanded(&key, false, cx);
@@ -4412,7 +5301,11 @@ impl Sidebar {
             }
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 for i in (0..ix).rev() {
-                    if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
+                    if let Some(ListEntry::ProjectHeader {
+                        key,
+                        is_synthetic: false,
+                        ..
+                    }) = self.contents.entries.get(i)
                     {
                         let key = key.clone();
                         self.selection = Some(i);
@@ -4447,7 +5340,11 @@ impl Sidebar {
         };
 
         if let Some(header_ix) = header_ix {
-            if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(header_ix)
+            if let Some(ListEntry::ProjectHeader {
+                key,
+                is_synthetic: false,
+                ..
+            }) = self.contents.entries.get(header_ix)
             {
                 let key = key.clone();
                 if self.is_group_collapsed(&key, cx) {
@@ -4570,17 +5467,8 @@ impl Sidebar {
                 Self::load_agent_thread_in_workspace(&workspace, metadata, true, window, cx);
                 true
             }
-            ActivatableEntry::Terminal {
-                metadata,
-                workspace,
-            } => {
-                self.activate_terminal_entry(
-                    metadata.clone(),
-                    workspace.clone(),
-                    false,
-                    window,
-                    cx,
-                );
+            ActivatableEntry::Terminal(terminal) => {
+                self.activate_terminal_entry(terminal.clone(), false, window, cx);
                 true
             }
         }
@@ -4588,13 +5476,45 @@ impl Sidebar {
 
     fn activate_terminal_entry(
         &mut self,
-        metadata: TerminalThreadMetadata,
-        workspace: ThreadEntryWorkspace,
+        terminal: TerminalEntry,
         retain: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match workspace {
+        if let Some(center_view) = terminal.center_view.as_ref() {
+            let Some(center_view) = center_view.upgrade() else {
+                self.schedule_update_entries(false, cx);
+                return;
+            };
+            self.clear_center_terminal_notification(center_view.entity_id(), cx);
+            let ThreadEntryWorkspace::Open(workspace) = terminal.workspace else {
+                return;
+            };
+            let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+                return;
+            };
+
+            let terminal_id = terminal.metadata.terminal_id;
+            self.record_terminal_access(terminal_id);
+            self.active_entry = Some(ActiveEntry::Terminal {
+                terminal_id,
+                workspace: workspace.clone(),
+            });
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx);
+                if retain {
+                    multi_workspace.retain_active_workspace(cx);
+                }
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&center_view, true, true, window, cx);
+            });
+            self.update_entries(cx);
+            return;
+        }
+
+        let metadata = terminal.metadata;
+        match terminal.workspace {
             ThreadEntryWorkspace::Open(workspace) => {
                 self.activate_terminal_in_workspace(&workspace, metadata, retain, window, cx);
             }
@@ -5187,6 +6107,39 @@ impl Sidebar {
                 );
             },
         );
+    }
+
+    fn close_terminal_row(
+        &mut self,
+        terminal: &TerminalEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(center_view) = terminal.center_view.as_ref() {
+            let Some(center_view) = center_view.upgrade() else {
+                self.schedule_update_entries(false, cx);
+                return;
+            };
+            let ThreadEntryWorkspace::Open(workspace) = &terminal.workspace else {
+                return;
+            };
+            let item_id = center_view.entity_id();
+            let pane = workspace.read(cx).panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .any(|item| item.item_id() == item_id)
+                    .then(|| pane.clone())
+            });
+            if let Some(pane) = pane {
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+                        .detach_and_log_err(cx);
+                });
+            }
+            return;
+        }
+
+        self.close_terminal(&terminal.metadata, &terminal.workspace, window, cx);
     }
 
     fn close_terminal_entry(
@@ -5783,9 +6736,8 @@ impl Sidebar {
                 }
             }
             Some(ListEntry::Terminal(terminal)) => {
-                let metadata = terminal.metadata.clone();
-                let workspace = terminal.workspace.clone();
-                self.close_terminal(&metadata, &workspace, window, cx);
+                let terminal = terminal.clone();
+                self.close_terminal_row(&terminal, window, cx);
             }
             _ => {}
         }
@@ -5954,6 +6906,8 @@ impl Sidebar {
                     Some(ThreadSwitcherEntry::Terminal(ThreadSwitcherTerminalEntry {
                         metadata: terminal.metadata.clone(),
                         workspace: terminal.workspace.clone(),
+                        center_view: terminal.center_view.clone(),
+                        icon: terminal.icon,
                         project_name: current_header_label.clone(),
                         worktrees: terminal
                             .worktrees
@@ -6024,6 +6978,8 @@ impl Sidebar {
             ThreadSwitcherSelection::Terminal {
                 metadata,
                 workspace,
+                center_view,
+                ..
             } => {
                 if let ThreadEntryWorkspace::Open(workspace) = workspace {
                     if let Some(multi_workspace) = self.multi_workspace.upgrade() {
@@ -6036,7 +6992,20 @@ impl Sidebar {
                         workspace: workspace.clone(),
                     });
                     self.update_entries(cx);
-                    Self::load_agent_terminal_in_workspace(workspace, metadata, false, window, cx);
+                    match center_view {
+                        Some(center_view) => {
+                            if let Some(center_view) = center_view.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.activate_item(&center_view, true, false, window, cx);
+                                });
+                            } else {
+                                self.schedule_update_entries(false, cx);
+                            }
+                        }
+                        None => Self::load_agent_terminal_in_workspace(
+                            workspace, metadata, false, window, cx,
+                        ),
+                    }
                 }
             }
         }
@@ -6072,9 +7041,24 @@ impl Sidebar {
             ThreadSwitcherSelection::Terminal {
                 metadata,
                 workspace,
+                center_view,
+                icon,
             } => {
                 self.dismiss_thread_switcher(cx);
-                self.activate_terminal_entry(metadata.clone(), workspace.clone(), true, window, cx);
+                self.activate_terminal_entry(
+                    TerminalEntry {
+                        metadata: metadata.clone(),
+                        workspace: workspace.clone(),
+                        worktrees: Vec::new(),
+                        icon: *icon,
+                        center_view: center_view.clone(),
+                        has_notification: false,
+                        highlight_positions: Vec::new(),
+                    },
+                    true,
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -6613,8 +7597,7 @@ impl Sidebar {
         let sidebar_bg = color.surface_background;
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
-        let metadata = terminal.metadata.clone();
-        let workspace = terminal.workspace.clone();
+        let terminal_for_close = terminal.clone();
         let focus_handle = self.focus_handle.clone();
         let worktrees = apply_worktree_label_mode(
             terminal.worktrees.clone(),
@@ -6626,15 +7609,18 @@ impl Sidebar {
         let rename_title_editor = is_renaming.then(|| self.render_rename_title_editor(cx));
 
         let display_title = terminal.metadata.display_title();
-        let (icon_char, title, highlight_positions) =
+        let (icon_char, title, highlight_positions) = if terminal.center_view.is_some() {
+            (None, display_title, terminal.highlight_positions.clone())
+        } else {
             match split_leading_icon_char(&display_title, &terminal.highlight_positions) {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
-            };
+            }
+        };
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(terminal.icon)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
             .worktrees(worktrees)
@@ -6674,22 +7660,15 @@ impl Sidebar {
                             }
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_terminal(&metadata, &workspace, window, cx);
+                            this.close_terminal_row(&terminal_for_close, window, cx);
                         })),
                 )
             })
             .on_click(cx.listener({
-                let metadata = terminal.metadata.clone();
-                let workspace = terminal.workspace.clone();
+                let terminal = terminal.clone();
                 move |this, _, window, cx| {
                     this.selection = None;
-                    this.activate_terminal_entry(
-                        metadata.clone(),
-                        workspace.clone(),
-                        false,
-                        window,
-                        cx,
-                    );
+                    this.activate_terminal_entry(terminal.clone(), false, window, cx);
                 }
             }));
 
@@ -7113,12 +8092,20 @@ impl Sidebar {
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {
         let ix = self.selection?;
         match self.contents.entries.get(ix) {
-            Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+            Some(ListEntry::ProjectHeader {
+                key,
+                is_synthetic: false,
+                ..
+            }) => Some(key.clone()),
             Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
                 (0..ix)
                     .rev()
                     .find_map(|i| match self.contents.entries.get(i) {
-                        Some(ListEntry::ProjectHeader { key, .. }) => Some(key.clone()),
+                        Some(ListEntry::ProjectHeader {
+                            key,
+                            is_synthetic: false,
+                            ..
+                        }) => Some(key.clone()),
                         _ => None,
                     })
             }
@@ -7299,9 +8286,7 @@ impl Sidebar {
                 }
             }
             ListEntry::Terminal(terminal) => {
-                let metadata = terminal.metadata.clone();
-                let workspace = terminal.workspace.clone();
-                self.activate_terminal_entry(metadata, workspace, true, window, cx);
+                self.activate_terminal_entry(terminal.clone(), true, window, cx);
             }
             ListEntry::ProjectHeader { .. } => {}
         }

@@ -41,15 +41,48 @@ fn product_version() -> String {
 const ICON_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zed/resources/windows");
 const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/manifest.xml");
 
+fn icon_filename(channel: &str, variant: Option<&str>) -> Result<&'static str, String> {
+    match variant {
+        Some("main") => Ok("app-icon.ico"),
+        Some("debug") => Ok("app-icon-dev.ico"),
+        Some(value) => Err(format!(
+            "invalid SUPRZED_WINDOWS_ICON {value:?}; expected main or debug"
+        )),
+        None => Ok(match channel {
+            "stable" => "app-icon.ico",
+            "preview" => "app-icon-preview.ico",
+            "nightly" => "app-icon-nightly.ico",
+            _ => "app-icon-dev.ico",
+        }),
+    }
+}
+
 pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
     let channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
-    let (icon_filename, product_name) = match channel {
-        "stable" => ("app-icon.ico", "Zed"),
-        "preview" => ("app-icon-preview.ico", "Zed Preview"),
-        "nightly" => ("app-icon-nightly.ico", "Zed Nightly"),
-        _ => ("app-icon-dev.ico", "Zed Dev"),
+    println!("cargo:rerun-if-env-changed=SUPRZED_WINDOWS_ICON");
+    let variant = match std::env::var("SUPRZED_WINDOWS_ICON") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let icon_filename = icon_filename(channel, variant.as_deref())?;
+    let product_name = match channel {
+        "stable" => "Zed",
+        "preview" => "Zed Preview",
+        "nightly" => "Zed Nightly",
+        _ => "Zed Dev",
+    };
+    println!("cargo:rerun-if-env-changed=SUPRZED_BUILD_ORIGIN");
+    let product_name = if std::env::var("SUPRZED_BUILD_ORIGIN").as_deref() == Ok("managed") {
+        "suprZed"
+    } else {
+        product_name
     };
     let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
+    println!("cargo:rerun-if-changed={}", icon.display());
+    if manifest {
+        println!("cargo:rerun-if-changed={MANIFEST_PATH}");
+    }
     let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");
 
     let manifest_line = if manifest {
@@ -128,4 +161,45 @@ END
         .unwrap();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::icon_filename;
+
+    #[test]
+    fn main_icon_does_not_require_a_stable_channel() {
+        assert_eq!(
+            icon_filename("dev", Some("main")).as_deref(),
+            Ok("app-icon.ico")
+        );
+    }
+
+    #[test]
+    fn debug_icon_does_not_require_a_dev_channel() {
+        assert_eq!(
+            icon_filename("stable", Some("debug")).as_deref(),
+            Ok("app-icon-dev.ico")
+        );
+    }
+
+    #[test]
+    fn ordinary_builds_keep_channel_icons() {
+        for (channel, expected) in [
+            ("stable", "app-icon.ico"),
+            ("preview", "app-icon-preview.ico"),
+            ("nightly", "app-icon-nightly.ico"),
+            ("dev", "app-icon-dev.ico"),
+            ("unknown", "app-icon-dev.ico"),
+        ] {
+            assert_eq!(icon_filename(channel, None).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_variants_cannot_silently_use_another_icon() {
+        for variant in ["", "stable", "Main", "release"] {
+            assert!(icon_filename("dev", Some(variant)).is_err());
+        }
+    }
 }

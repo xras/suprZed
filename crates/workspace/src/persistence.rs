@@ -535,6 +535,21 @@ impl sqlez::bindable::Bind for SerializedPixels {
 
 pub struct WorkspaceDb(ThreadSafeConnection);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectThemeKey {
+    pub remote_identity: String,
+    pub worktree_root_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickFolderRecord {
+    pub remote_identity: String,
+    pub worktree_root_path: PathBuf,
+    pub relative_path: String,
+    pub is_pinned: bool,
+    pub position: usize,
+}
+
 impl Domain for WorkspaceDb {
     const NAME: &str = stringify!(WorkspaceDb);
 
@@ -1065,6 +1080,40 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        sql!(
+            CREATE TABLE quick_folders (
+                workspace_id INTEGER NOT NULL,
+                remote_identity TEXT NOT NULL,
+                worktree_root_path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                is_pinned INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                PRIMARY KEY (
+                    workspace_id,
+                    remote_identity,
+                    worktree_root_path,
+                    relative_path,
+                    is_pinned
+                ),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            ) STRICT;
+        ),
+        sql!(
+            CREATE TABLE project_themes (
+                remote_identity TEXT NOT NULL,
+                worktree_root_path TEXT NOT NULL,
+                theme_name TEXT NOT NULL,
+                PRIMARY KEY (remote_identity, worktree_root_path)
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE items ADD COLUMN persistent_item_id TEXT;
+            CREATE UNIQUE INDEX items_persistent_item_identity
+            ON items(workspace_id, kind, persistent_item_id)
+            WHERE persistent_item_id IS NOT NULL;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1078,6 +1127,126 @@ impl Domain for WorkspaceDb {
 db::static_connection!(WorkspaceDb, []);
 
 impl WorkspaceDb {
+    pub async fn project_theme(&self, key: ProjectThemeKey) -> Result<Option<String>> {
+        self.write(move |connection| {
+            let mut select = connection
+                .select_bound(sql!(
+                    SELECT theme_name
+                    FROM project_themes
+                    WHERE remote_identity = ? AND worktree_root_path = ?
+                ))
+                .context("select project theme")?;
+            let mut themes: Vec<String> = select((
+                key.remote_identity,
+                key.worktree_root_path.to_string_lossy().into_owned(),
+            ))?;
+            Ok(themes.pop())
+        })
+        .await
+    }
+
+    pub async fn set_project_theme(&self, key: ProjectThemeKey, theme_name: String) -> Result<()> {
+        self.write(move |connection| {
+            connection.exec_bound(sql!(
+                INSERT INTO project_themes(remote_identity, worktree_root_path, theme_name)
+                VALUES (?, ?, ?)
+                ON CONFLICT(remote_identity, worktree_root_path) DO UPDATE SET
+                    theme_name = excluded.theme_name
+            ))?((
+                key.remote_identity,
+                key.worktree_root_path.to_string_lossy().into_owned(),
+                theme_name,
+            ))
+        })
+        .await
+    }
+
+    pub async fn initialize_project_theme(
+        &self,
+        key: ProjectThemeKey,
+        theme_name: String,
+    ) -> Result<()> {
+        self.write(move |connection| {
+            connection.exec_bound(sql!(
+                INSERT OR IGNORE INTO project_themes(
+                    remote_identity,
+                    worktree_root_path,
+                    theme_name
+                ) VALUES (?, ?, ?)
+            ))?((
+                key.remote_identity,
+                key.worktree_root_path.to_string_lossy().into_owned(),
+                theme_name,
+            ))
+        })
+        .await
+    }
+
+    pub async fn quick_folders(&self, workspace_id: WorkspaceId) -> Result<Vec<QuickFolderRecord>> {
+        self.write(move |connection| {
+            let mut select = connection
+                .select_bound(sql!(
+                    SELECT remote_identity, worktree_root_path, relative_path, is_pinned, position
+                    FROM quick_folders
+                    WHERE workspace_id = ?
+                    ORDER BY is_pinned DESC, position ASC
+                ))
+                .context("select quick folders")?;
+            let rows: Vec<(String, String, String, bool, i64)> = select(workspace_id)?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(remote_identity, worktree_root_path, relative_path, is_pinned, position)| {
+                        QuickFolderRecord {
+                            remote_identity,
+                            worktree_root_path: worktree_root_path.into(),
+                            relative_path,
+                            is_pinned,
+                            position: position.max(0) as usize,
+                        }
+                    },
+                )
+                .collect())
+        })
+        .await
+    }
+
+    pub async fn set_quick_folders(
+        &self,
+        workspace_id: WorkspaceId,
+        records: Vec<QuickFolderRecord>,
+    ) -> Result<()> {
+        self.write(move |connection| {
+            connection.exec_bound(sql!(DELETE FROM quick_folders WHERE workspace_id = ?))?(
+                workspace_id,
+            )?;
+            let mut insert = connection
+                .exec_bound(sql!(
+                    INSERT INTO quick_folders(
+                        workspace_id,
+                        remote_identity,
+                        worktree_root_path,
+                        relative_path,
+                        is_pinned,
+                        position
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                ))
+                .context("prepare quick folder insertion")?;
+            for record in records {
+                insert((
+                    workspace_id,
+                    record.remote_identity,
+                    record.worktree_root_path.to_string_lossy().into_owned(),
+                    record.relative_path,
+                    record.is_pinned,
+                    record.position as i64,
+                ))?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Returns a serialized workspace for the given worktree_roots. If the passed array
     /// is empty, the most recent workspace is returned instead. If no workspace for the
     /// passed roots is stored, returns none.
@@ -2435,7 +2604,7 @@ impl WorkspaceDb {
 
     fn get_items(&self, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
         self.select_bound(sql!(
-            SELECT kind, item_id, active, preview FROM items
+            SELECT kind, item_id, persistent_item_id, active, preview FROM items
             WHERE pane_id = ?
                 ORDER BY position
         ))?(pane_id)
@@ -2448,7 +2617,7 @@ impl WorkspaceDb {
         items: &[SerializedItem],
     ) -> Result<()> {
         let mut insert = conn.exec_bound(sql!(
-            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active, preview) VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, persistent_item_id, active, preview) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         )).context("Preparing insertion")?;
         for (position, item) in items.iter().enumerate() {
             insert((workspace_id, pane_id, position, item))?;
@@ -2807,7 +2976,188 @@ pub fn delete_unloaded_items(
 
 #[cfg(test)]
 mod tests {
+    use super::model::PersistentItemId;
     use super::*;
+
+    #[gpui::test]
+    async fn test_project_theme_round_trip() {
+        let database = WorkspaceDb::open_test_db("test_project_theme_round_trip").await;
+
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                })
+                .await
+                .unwrap(),
+            None
+        );
+
+        database
+            .set_project_theme(
+                ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                },
+                "One Dark".into(),
+            )
+            .await
+            .unwrap();
+        database
+            .set_project_theme(
+                ProjectThemeKey {
+                    remote_identity: "ssh:user@example.com:22".into(),
+                    worktree_root_path: "/project-a".into(),
+                },
+                "Solarized Light".into(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("One Dark")
+        );
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: "ssh:user@example.com:22".into(),
+                    worktree_root_path: "/project-a".into(),
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Solarized Light")
+        );
+
+        database
+            .set_project_theme(
+                ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                },
+                "Ayu Dark".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ayu Dark")
+        );
+
+        database
+            .initialize_project_theme(
+                ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                },
+                "Default".into(),
+            )
+            .await
+            .unwrap();
+        database
+            .initialize_project_theme(
+                ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-b".into(),
+                },
+                "Default".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-a".into(),
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Ayu Dark")
+        );
+        assert_eq!(
+            database
+                .project_theme(ProjectThemeKey {
+                    remote_identity: String::new(),
+                    worktree_root_path: "/project-b".into(),
+                })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Default")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_quick_folder_workspace_round_trip() {
+        let database = WorkspaceDb::open_test_db("test_quick_folder_workspace_round_trip").await;
+        let workspace_id = database.next_id().await.unwrap();
+        database
+            .save_workspace(SerializedWorkspace {
+                id: workspace_id,
+                location: SerializedWorkspaceLocation::Local,
+                paths: PathList::new(&["/project-a", "/project-b"]),
+                identity_paths: None,
+                center_group: Default::default(),
+                window_bounds: None,
+                centered_layout: false,
+                display: None,
+                docks: Default::default(),
+                session_id: None,
+                bookmarks: Default::default(),
+                breakpoints: Default::default(),
+                user_toolchains: Default::default(),
+                recent_navigation_history: Default::default(),
+                window_id: None,
+            })
+            .await;
+
+        let records = vec![
+            QuickFolderRecord {
+                remote_identity: String::new(),
+                worktree_root_path: "/project-a".into(),
+                relative_path: "src".into(),
+                is_pinned: true,
+                position: 0,
+            },
+            QuickFolderRecord {
+                remote_identity: String::new(),
+                worktree_root_path: "/project-b".into(),
+                relative_path: "src".into(),
+                is_pinned: true,
+                position: 1,
+            },
+            QuickFolderRecord {
+                remote_identity: "ssh:user@example.com:22".into(),
+                worktree_root_path: "/project-a".into(),
+                relative_path: "src".into(),
+                is_pinned: false,
+                position: 0,
+            },
+        ];
+        database
+            .set_quick_folders(workspace_id, records.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(database.quick_folders(workspace_id).await.unwrap(), records);
+    }
     use crate::PathList;
     use crate::ProjectGroupKey;
     use crate::RemovalIntent;
@@ -3421,6 +3771,9 @@ mod tests {
         zlog::init_test();
 
         let db = WorkspaceDb::open_test_db("test_full_workspace_serialization").await;
+        let mut persistent_terminal = SerializedItem::new("Terminal", 5, false, false);
+        persistent_terminal.persistent_item_id =
+            Some(PersistentItemId::new("persistent-terminal-5"));
 
         //  -----------------
         //  | 1,2   | 5,6   |
@@ -3435,7 +3788,7 @@ mod tests {
                     vec![
                         SerializedPaneGroup::Pane(SerializedPane::new(
                             vec![
-                                SerializedItem::new("Terminal", 5, false, false),
+                                persistent_terminal,
                                 SerializedItem::new("Terminal", 6, true, false),
                             ],
                             false,

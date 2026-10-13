@@ -88,10 +88,11 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
+    ProjectThemeKey, QuickFolderRecord, RecentWorkspace, WorkspaceDb, delete_unloaded_items,
     model::{
-        DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
-        SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
+        DockData, DockStructure, ItemId, MultiWorkspaceState, PersistentItemId,
+        SerializedMultiWorkspace, SerializedProjectGroup, SerializedWorkspaceLocation,
+        SessionWorkspace,
     },
     read_serialized_multi_workspaces,
 };
@@ -144,7 +145,7 @@ use std::{
 };
 use task::{DebugScenario, SharedTaskContext, SpawnInTerminal};
 use theme::{ActiveTheme, ClientDecorationsExt, SystemAppearance};
-use theme_settings::ThemeSettings;
+use theme_settings::{ThemeName, ThemeSettings};
 pub use toolbar::{
     PaneSearchBarCallbacks, Toolbar, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
 };
@@ -1239,10 +1240,17 @@ struct SerializableItemDescriptor {
         WeakEntity<Workspace>,
         WorkspaceId,
         ItemId,
+        Option<PersistentItemId>,
         &mut Window,
         &mut Context<Pane>,
     ) -> Task<Result<Box<dyn ItemHandle>>>,
-    cleanup: fn(WorkspaceId, Vec<ItemId>, &mut Window, &mut App) -> Task<Result<()>>,
+    cleanup: fn(
+        WorkspaceId,
+        Vec<ItemId>,
+        Vec<PersistentItemId>,
+        &mut Window,
+        &mut App,
+    ) -> Task<Result<()>>,
     view_to_serializable_item: fn(AnyView) -> Box<dyn SerializableItemHandle>,
 }
 
@@ -1261,6 +1269,7 @@ impl SerializableItemRegistry {
         workspace: WeakEntity<Workspace>,
         workspace_id: WorkspaceId,
         item_item: ItemId,
+        persistent_item_id: Option<PersistentItemId>,
         window: &mut Window,
         cx: &mut Context<Pane>,
     ) -> Task<Result<Box<dyn ItemHandle>>> {
@@ -1271,13 +1280,22 @@ impl SerializableItemRegistry {
             )));
         };
 
-        (descriptor.deserialize)(project, workspace, workspace_id, item_item, window, cx)
+        (descriptor.deserialize)(
+            project,
+            workspace,
+            workspace_id,
+            item_item,
+            persistent_item_id,
+            window,
+            cx,
+        )
     }
 
     fn cleanup(
         item_kind: &str,
         workspace_id: WorkspaceId,
         loaded_items: Vec<ItemId>,
+        persistent_item_ids: Vec<PersistentItemId>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>> {
@@ -1288,7 +1306,7 @@ impl SerializableItemRegistry {
             )));
         };
 
-        (descriptor.cleanup)(workspace_id, loaded_items, window, cx)
+        (descriptor.cleanup)(workspace_id, loaded_items, persistent_item_ids, window, cx)
     }
 
     fn view_to_serializable_item_handle(
@@ -1304,6 +1322,26 @@ impl SerializableItemRegistry {
         let this = cx.try_global::<Self>()?;
         this.descriptors_by_kind.get(item_kind).copied()
     }
+
+    fn registered_item_kinds(cx: &App) -> Vec<Arc<str>> {
+        cx.try_global::<Self>()
+            .map(|registry| registry.descriptors_by_kind.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+// A registered kind with no serialized center items is deliberately considered complete, so its
+// cleanup can remove stale center rows. Cleanup implementations therefore must only delete state
+// whose liveness is represented by the center group; kinds that persist panel or other external
+// state must keep that state in a separately scoped table/cleanup path.
+fn item_kind_restore_complete(
+    item_kind: &str,
+    expected_counts: &HashMap<Arc<str>, usize>,
+    restored_items: &HashMap<&'static str, Vec<ItemId>>,
+) -> bool {
+    let expected_count = expected_counts.get(item_kind).copied().unwrap_or_default();
+    let restored_count = restored_items.get(item_kind).map_or(0, Vec::len);
+    restored_count == expected_count
 }
 
 pub fn register_serializable_item<I: SerializableItem>(cx: &mut App) {
@@ -1311,13 +1349,27 @@ pub fn register_serializable_item<I: SerializableItem>(cx: &mut App) {
 
     let registry = cx.default_global::<SerializableItemRegistry>();
     let descriptor = SerializableItemDescriptor {
-        deserialize: |project, workspace, workspace_id, item_id, window, cx| {
-            let task = I::deserialize(project, workspace, workspace_id, item_id, window, cx);
+        deserialize: |project, workspace, workspace_id, item_id, persistent_item_id, window, cx| {
+            let task = I::deserialize_with_persistent_item_id(
+                project,
+                workspace,
+                workspace_id,
+                item_id,
+                persistent_item_id,
+                window,
+                cx,
+            );
             cx.foreground_executor()
                 .spawn(async { Ok(Box::new(task.await?) as Box<_>) })
         },
-        cleanup: |workspace_id, loaded_items, window, cx| {
-            I::cleanup(workspace_id, loaded_items, window, cx)
+        cleanup: |workspace_id, loaded_items, persistent_item_ids, window, cx| {
+            I::cleanup_with_persistent_item_ids(
+                workspace_id,
+                loaded_items,
+                persistent_item_ids,
+                window,
+                cx,
+            )
         },
         view_to_serializable_item: |view| Box::new(view.downcast::<I>().unwrap()),
     };
@@ -1653,6 +1705,9 @@ pub struct Workspace {
     deferred_save_items: Vec<Box<dyn WeakItemHandle>>,
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
+    selected_theme_worktree_root: Option<PathBuf>,
+    active_project_theme_resolution: Option<(ProjectThemeKey, ThemeName)>,
+    active_project_theme_resolution_generation: u64,
     restoring_workspace: bool,
 }
 
@@ -1750,6 +1805,8 @@ impl Workspace {
             match event {
                 project::Event::RemoteIdChanged(_) => {
                     this.update_window_title(window, cx);
+                    this.initialize_project_themes(cx);
+                    this.refresh_active_project_theme(cx);
                 }
 
                 project::Event::CollaboratorLeft(peer_id) => {
@@ -1760,6 +1817,7 @@ impl Workspace {
                     this.update_window_title(window, cx);
                     this.serialize_workspace(window, cx);
                     this.update_history(cx);
+                    this.refresh_active_project_theme(cx);
                 }
 
                 &project::Event::WorktreeAdded(id) => {
@@ -1770,6 +1828,10 @@ impl Workspace {
                         .worktree_for_id(id, cx)
                         .is_some_and(|wt| wt.read(cx).is_visible())
                     {
+                        if let Some(key) = this.project_theme_key(id, cx) {
+                            this.initialize_project_theme(key, cx);
+                        }
+                        this.refresh_active_project_theme(cx);
                         this.serialize_workspace(window, cx);
                         this.update_history(cx);
                     }
@@ -2079,12 +2141,23 @@ impl Workspace {
 
         cx.defer_in(window, move |this, window, cx| {
             this.update_window_title(window, cx);
+            this.initialize_project_themes(cx);
+            this.refresh_active_project_theme(cx);
             this.show_initial_notifications(cx);
         });
 
         let mut center = PaneGroup::new(center_pane.clone());
         center.set_is_center(true);
         center.mark_positions(cx);
+
+        let selected_theme_worktree_root = workspace_id.and_then(|workspace_id| {
+            db::kvp::KeyValueStore::global(cx)
+                .scoped("workspace_theme_worktree")
+                .read(&workspace_id.0.to_string())
+                .log_err()
+                .flatten()
+                .map(PathBuf::from)
+        });
 
         Workspace {
             weak_self: weak_handle.clone(),
@@ -2155,6 +2228,9 @@ impl Workspace {
             deferred_save_items: Vec::new(),
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
+            selected_theme_worktree_root,
+            active_project_theme_resolution: None,
+            active_project_theme_resolution_generation: 0,
             restoring_workspace: false,
         }
     }
@@ -3009,6 +3085,7 @@ impl Workspace {
                 });
 
             if let Some(item) = pane.active_item()
+                && item.include_in_nav_history()
                 && let Some(project_path) = item.project_path(cx)
             {
                 let fs_path = self.project.read(cx).absolute_path(&project_path, cx);
@@ -3052,6 +3129,12 @@ impl Workspace {
             let Some(project_path) = project.project_path_for_absolute_path(abs_path, cx) else {
                 continue;
             };
+            if project
+                .entry_for_path(&project_path, cx)
+                .is_some_and(|entry| entry.is_dir())
+            {
+                continue;
+            }
             if seen_paths.insert(project_path.clone()) {
                 recent_history.push((project_path, Some(abs_path.clone())));
             }
@@ -3105,7 +3188,13 @@ impl Workspace {
     }
 
     fn remember_navigation_history_path(&mut self, project_path: &ProjectPath, cx: &App) -> bool {
-        if self.restoring_workspace {
+        if self.restoring_workspace
+            || self
+                .project
+                .read(cx)
+                .entry_for_path(project_path, cx)
+                .is_some_and(|entry| entry.is_dir())
+        {
             return false;
         }
         let Some(absolute_path) = self.project.read(cx).absolute_path(project_path, cx) else {
@@ -4327,6 +4416,166 @@ impl Workspace {
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
         self.active_item(cx).and_then(|item| item.project_path(cx))
+    }
+
+    pub fn active_project_theme_key(&self, cx: &App) -> Option<ProjectThemeKey> {
+        let project = self.project.read(cx);
+        let worktree_id = self
+            .selected_theme_worktree_root
+            .as_ref()
+            .and_then(|root| {
+                project
+                    .visible_worktrees(cx)
+                    .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+                    .map(|worktree| worktree.read(cx).id())
+            })
+            .or_else(|| {
+                project
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).id())
+            })?;
+        self.project_theme_key(worktree_id, cx)
+    }
+
+    fn select_theme_worktree(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        let root = worktree.read(cx).abs_path().to_path_buf();
+        if self.selected_theme_worktree_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.selected_theme_worktree_root = Some(root.clone());
+        self.refresh_active_project_theme(cx);
+        if let Some(workspace_id) = self.database_id {
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            cx.background_spawn(async move {
+                kvp.scoped("workspace_theme_worktree")
+                    .write(
+                        workspace_id.0.to_string(),
+                        root.to_string_lossy().into_owned(),
+                    )
+                    .await
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+
+    fn project_theme_key(&self, worktree_id: WorktreeId, cx: &App) -> Option<ProjectThemeKey> {
+        let project = self.project.read(cx);
+        let worktree = project.worktree_for_id(worktree_id, cx)?;
+        let worktree_root_path = worktree.read(cx).abs_path().to_path_buf();
+        let remote_identity = project
+            .remote_connection_options(cx)
+            .as_ref()
+            .map(remote_connection_identity)
+            .map(|identity| identity.persistence_key())
+            .unwrap_or_default();
+        Some(ProjectThemeKey {
+            remote_identity,
+            worktree_root_path,
+        })
+    }
+
+    fn initialize_project_themes(&self, cx: &mut Context<Self>) {
+        let worktree_ids = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).id())
+            .collect::<Vec<_>>();
+        for worktree_id in worktree_ids {
+            if let Some(key) = self.project_theme_key(worktree_id, cx) {
+                self.initialize_project_theme(key, cx);
+            }
+        }
+    }
+
+    fn initialize_project_theme(&self, key: ProjectThemeKey, cx: &mut Context<Self>) {
+        let database = WorkspaceDb::global(cx);
+        let default_theme = theme_settings::global_theme_name(cx).0.to_string();
+        cx.spawn(async move |_, _| database.initialize_project_theme(key, default_theme).await)
+            .detach_and_log_err(cx);
+    }
+
+    fn apply_active_project_theme(&mut self, key: ProjectThemeKey, cx: &mut Context<Self>) {
+        self.active_project_theme_resolution_generation = self
+            .active_project_theme_resolution_generation
+            .wrapping_add(1);
+        let generation = self.active_project_theme_resolution_generation;
+        let database = WorkspaceDb::global(cx);
+        let default_theme = theme_settings::global_theme_name(cx).0.to_string();
+        let workspace = self.weak_self.clone();
+        cx.spawn(async move |_, cx| {
+            let theme_name = match database.project_theme(key.clone()).await {
+                Ok(Some(theme_name)) => theme_name,
+                Ok(None) => {
+                    database
+                        .initialize_project_theme(key.clone(), default_theme)
+                        .await?;
+                    database
+                        .project_theme(key.clone())
+                        .await?
+                        .context("project theme was not initialized")?
+                }
+                Err(error) => {
+                    log::error!("failed to load project theme: {error:#}");
+                    return anyhow::Ok(());
+                }
+            };
+
+            workspace.update(cx, |workspace, cx| {
+                if workspace.owns_window_chrome()
+                    && workspace.active_project_theme_resolution_generation == generation
+                    && workspace.active_project_theme_key(cx).as_ref() == Some(&key)
+                {
+                    let theme_name = ThemeName(theme_name.into());
+                    workspace.active_project_theme_resolution = Some((key, theme_name.clone()));
+                    theme_settings::set_active_project_theme(theme_name, cx);
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    pub(crate) fn refresh_active_project_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.active_project_theme_key(cx) else {
+            self.invalidate_active_project_theme_resolution();
+            if self.owns_window_chrome() {
+                theme_settings::clear_active_project_theme(cx);
+            }
+            return;
+        };
+        let active_theme = theme_settings::active_project_theme_name(cx).cloned();
+        if let Some((resolved_key, resolved_theme)) = self.active_project_theme_resolution.as_mut()
+            && resolved_key == &key
+        {
+            if let Some(active_theme) = active_theme {
+                *resolved_theme = active_theme;
+            }
+            return;
+        }
+        self.apply_active_project_theme(key, cx);
+    }
+
+    pub(crate) fn invalidate_active_project_theme_resolution(&mut self) {
+        self.active_project_theme_resolution_generation = self
+            .active_project_theme_resolution_generation
+            .wrapping_add(1);
+        self.active_project_theme_resolution = None;
+    }
+
+    pub fn record_active_project_theme_assignment(
+        &mut self,
+        key: ProjectThemeKey,
+        theme_name: ThemeName,
+    ) {
+        self.active_project_theme_resolution_generation = self
+            .active_project_theme_resolution_generation
+            .wrapping_add(1);
+        self.active_project_theme_resolution = Some((key, theme_name));
     }
 
     pub fn most_recent_active_path(&self, cx: &App) -> Option<PathBuf> {
@@ -6623,6 +6872,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         cx.emit(Event::ActiveItemChanged);
+        if !self.restoring_workspace {
+            if let Some(item) = self.active_item(cx)
+                && item.affects_workspace_theme(cx)
+                && let Some(path) = item.project_path(cx)
+            {
+                self.select_theme_worktree(path.worktree_id, cx);
+            }
+        }
         let active_entry = self.active_project_path(cx);
         let active_project_path_changed =
             self.last_active_project_path.as_ref() != active_entry.as_ref();
@@ -6649,10 +6906,16 @@ impl Workspace {
         if active_project_path_changed {
             match active_entry.as_ref() {
                 None => self.last_active_project_path = None,
-                Some(path) if self.remember_navigation_history_path(path, cx) => {
-                    self.serialize_workspace(window, cx);
+                Some(path) => {
+                    self.last_active_project_path = Some(path.clone());
+                    if self
+                        .active_item(cx)
+                        .is_some_and(|item| item.include_in_nav_history())
+                        && self.remember_navigation_history_path(path, cx)
+                    {
+                        self.serialize_workspace(window, cx);
+                    }
                 }
-                Some(_) => {}
             }
         }
 
@@ -6729,6 +6992,7 @@ impl Workspace {
         } else if project.is_shared() {
             title.push_str(" ↗");
         }
+        title.push_str(&format!(" — suprZed PID{}", std::process::id()));
 
         let document_path = active_project_path
             .as_ref()
@@ -7877,6 +8141,10 @@ impl Workspace {
                 workspace.restoring_workspace = true;
             })?;
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
+            let mut expected_center_item_counts = HashMap::default();
+            serialized_workspace
+                .center_group
+                .item_counts_by_kind(&mut expected_center_item_counts);
 
             let mut center_group = None;
             let mut center_items = None;
@@ -7893,14 +8161,24 @@ impl Workspace {
 
             let mut items_by_project_path = HashMap::default();
             let mut item_ids_by_kind = HashMap::default();
+            let mut persistent_item_ids_by_kind = HashMap::default();
             let mut all_deserialized_items = Vec::default();
             cx.update(|_, cx| {
                 for item in center_items.unwrap_or_default().into_iter().flatten() {
                     if let Some(serializable_item_handle) = item.to_serializable_item_handle(cx) {
+                        let item_kind = serializable_item_handle.serialized_item_kind();
                         item_ids_by_kind
-                            .entry(serializable_item_handle.serialized_item_kind())
+                            .entry(item_kind)
                             .or_insert(Vec::new())
                             .push(item.item_id().as_u64() as ItemId);
+                        if let Some(persistent_item_id) =
+                            serializable_item_handle.persistent_item_id(cx)
+                        {
+                            persistent_item_ids_by_kind
+                                .entry(item_kind)
+                                .or_insert(Vec::new())
+                                .push(persistent_item_id);
+                        }
                     }
 
                     if let Some(project_path) = item.project_path(cx) {
@@ -7951,6 +8229,24 @@ impl Workspace {
                 }
 
                 workspace.restoring_workspace = false;
+                let has_saved_theme_worktree = workspace
+                    .selected_theme_worktree_root
+                    .as_ref()
+                    .is_some_and(|root| {
+                        workspace
+                            .project
+                            .read(cx)
+                            .visible_worktrees(cx)
+                            .any(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+                    });
+                if !has_saved_theme_worktree
+                    && let Some(item) = workspace.active_item(cx)
+                    && item.affects_workspace_theme(cx)
+                    && let Some(path) = item.project_path(cx)
+                {
+                    workspace.select_theme_worktree(path.worktree_id, cx);
+                }
+                workspace.refresh_active_project_theme(cx);
                 cx.notify();
             })?;
 
@@ -7980,17 +8276,32 @@ impl Workspace {
             //
             // The items that have been loaded, have been saved after they've been added to the workspace.
             let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
-                item_ids_by_kind
+                SerializableItemRegistry::registered_item_kinds(cx)
                     .into_iter()
-                    .map(|(item_kind, loaded_items)| {
-                        SerializableItemRegistry::cleanup(
-                            item_kind,
-                            serialized_workspace.id,
-                            loaded_items,
-                            window,
-                            cx,
+                    .filter_map(|item_kind| {
+                        if !item_kind_restore_complete(
+                            &item_kind,
+                            &expected_center_item_counts,
+                            &item_ids_by_kind,
+                        ) {
+                            return None;
+                        }
+                        let loaded_items = item_ids_by_kind
+                            .remove(item_kind.as_ref())
+                            .unwrap_or_default();
+                        Some(
+                            SerializableItemRegistry::cleanup(
+                                &item_kind,
+                                serialized_workspace.id,
+                                loaded_items,
+                                persistent_item_ids_by_kind
+                                    .remove(item_kind.as_ref())
+                                    .unwrap_or_default(),
+                                window,
+                                cx,
+                            )
+                            .log_err(),
                         )
-                        .log_err()
                     })
                     .collect::<Vec<_>>()
             })?;
@@ -8462,6 +8773,24 @@ impl Workspace {
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_random_database_id(&mut self) {
         self.database_id = Some(WorkspaceId(Uuid::new_v4().as_u64_pair().0 as i64));
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_database_id_for_test(&mut self, database_id: WorkspaceId) {
+        self.database_id = Some(database_id);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn restore_database_layout_for_test(
+        workspace_id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<Option<Box<dyn ItemHandle>>>>> {
+        let Some(serialized_workspace) = WorkspaceDb::global(cx).workspace_for_id(workspace_id)
+        else {
+            return Task::ready(Err(anyhow!("workspace {workspace_id:?} was not persisted")));
+        };
+        Self::load_workspace(serialized_workspace, Vec::new(), window, cx)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -10651,6 +10980,7 @@ fn serialize_pane_handle(
                 Some(SerializedItem {
                     kind: Arc::from(handle.serialized_item_kind()),
                     item_id: handle.item_id().as_u64(),
+                    persistent_item_id: handle.persistent_item_id(cx),
                     active: Some(handle.item_id()) == active_item_id,
                     preview: pane.is_active_preview_item(handle.item_id()),
                 })
@@ -12495,8 +12825,39 @@ mod tests {
     use project::{Project, ProjectEntryId, WorktreeId};
     use serde_json::json;
     use settings::SettingsStore;
+    use theme::ThemeRegistry;
     use util::path;
     use util::rel_path::rel_path;
+
+    fn expected_window_title(title: &str) -> String {
+        format!("{title} — suprZed PID{}", std::process::id())
+    }
+
+    #[test]
+    fn restore_cleanup_completeness_is_isolated_by_item_kind() {
+        let mut expected = HashMap::default();
+        expected.insert(Arc::<str>::from("Terminal"), 1);
+        expected.insert(Arc::<str>::from("Image"), 1);
+        expected.insert(Arc::<str>::from("Unknown"), 1);
+        let mut restored = HashMap::default();
+        restored.insert("Terminal", vec![7]);
+
+        assert!(item_kind_restore_complete("Terminal", &expected, &restored));
+        assert!(!item_kind_restore_complete("Image", &expected, &restored));
+        assert!(!item_kind_restore_complete("Unknown", &expected, &restored));
+        // A completely enumerated registered kind with no center items may clean stale rows.
+        assert!(item_kind_restore_complete("Editor", &expected, &restored));
+
+        // A failed restore is uncertain even when every other kind completed, and suppresses only
+        // that kind's cleanup.
+        expected.insert(Arc::<str>::from("EmptyButUncertain"), 1);
+        assert!(!item_kind_restore_complete(
+            "EmptyButUncertain",
+            &expected,
+            &restored
+        ));
+        assert!(item_kind_restore_complete("Editor", &expected, &restored));
+    }
 
     #[test]
     fn test_render_window_title_format_omits_empty_segments() {
@@ -12732,13 +13093,19 @@ mod tests {
                     .map(|e| e.id)
             );
         });
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — one.txt").as_str())
+        );
 
         // Add a second item to a non-empty pane
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(Box::new(item2), None, true, window, cx)
         });
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — two.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — two.txt").as_str())
+        );
         project.update(cx, |project, cx| {
             assert_eq!(
                 project.active_entry(),
@@ -12754,7 +13121,10 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — one.txt").as_str())
+        );
         project.update(cx, |project, cx| {
             assert_eq!(
                 project.active_entry(),
@@ -12771,11 +13141,17 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(cx.window_title().as_deref(), Some("root1, root2 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1, root2 — one.txt").as_str())
+        );
 
         // Remove a project folder
         project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
-        assert_eq!(cx.window_title().as_deref(), Some("root2 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root2 — one.txt").as_str())
+        );
     }
 
     #[gpui::test]
@@ -12874,7 +13250,10 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx)
         });
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — one.txt").as_str())
+        );
 
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |settings, cx| {
@@ -12893,7 +13272,7 @@ mod tests {
         });
         assert_eq!(
             cx.window_title().as_deref(),
-            Some(format!("root1 — {expected_relative_path}").as_str())
+            Some(expected_window_title(&format!("root1 — {expected_relative_path}")).as_str())
         );
 
         cx.update(|_, cx| {
@@ -12906,7 +13285,7 @@ mod tests {
         cx.executor().run_until_parked();
         assert_eq!(
             cx.window_title().as_deref(),
-            Some(format!("root1 — {expected_relative_path}").as_str())
+            Some(expected_window_title(&format!("root1 — {expected_relative_path}")).as_str())
         );
 
         cx.update(|_, cx| {
@@ -12919,7 +13298,7 @@ mod tests {
         cx.executor().run_until_parked();
         assert_eq!(
             cx.window_title().as_deref(),
-            Some(format!("root1 | {expected_relative_path}").as_str())
+            Some(expected_window_title(&format!("root1 | {expected_relative_path}")).as_str())
         );
 
         cx.update(|_, cx| {
@@ -12931,7 +13310,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1").as_str())
+        );
 
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |settings, cx| {
@@ -12941,7 +13323,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 | one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 | one.txt").as_str())
+        );
 
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |settings, cx| {
@@ -12951,7 +13336,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 | one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 | one.txt").as_str())
+        );
 
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |settings, cx| {
@@ -12961,7 +13349,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 | one.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 | one.txt").as_str())
+        );
     }
 
     #[gpui::test]
@@ -12995,7 +13386,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("Zed — root1, root2"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("Zed — root1, root2").as_str())
+        );
 
         let item = cx.new(|cx| {
             TestItem::new(cx).with_project_items(&[TestProjectItem::new_in_worktree(
@@ -13012,7 +13406,10 @@ mod tests {
         let expected_file_path = path!("/root1/src/one.txt");
         assert_eq!(
             cx.window_title().as_deref(),
-            Some(format!("Zed — root1, root2 — one — {expected_file_path}").as_str())
+            Some(
+                expected_window_title(&format!("Zed — root1, root2 — one — {expected_file_path}"))
+                    .as_str()
+            )
         );
     }
 
@@ -13033,7 +13430,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("empty project"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("empty project").as_str())
+        );
     }
 
     #[gpui::test]
@@ -13058,7 +13458,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — main"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — main").as_str())
+        );
 
         let item = cx.new(|cx| {
             TestItem::new(cx).with_project_items(&[TestProjectItem::new(1, "a.txt", cx)])
@@ -13067,13 +13470,16 @@ mod tests {
             workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx)
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — main — a.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — main — a.txt").as_str())
+        );
 
         fs.set_branch_name(Path::new(path!("/root1/.git")), Some("feature"));
         cx.executor().run_until_parked();
         assert_eq!(
             cx.window_title().as_deref(),
-            Some("root1 — feature — a.txt")
+            Some(expected_window_title("root1 — feature — a.txt").as_str())
         );
 
         cx.update(|_, cx| {
@@ -13085,11 +13491,17 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — a.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — a.txt").as_str())
+        );
 
         fs.set_branch_name(Path::new(path!("/root1/.git")), Some("other"));
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — a.txt"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — a.txt").as_str())
+        );
     }
 
     #[gpui::test]
@@ -13119,7 +13531,10 @@ mod tests {
             });
         });
         cx.executor().run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1 — one.txt ↙"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1 — one.txt ↙").as_str())
+        );
     }
 
     #[gpui::test]
@@ -19203,7 +19618,10 @@ mod tests {
 
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1").as_str())
+        );
 
         // Activating a second workspace must update the shared window's title.
         multi_workspace_handle
@@ -19212,7 +19630,10 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root2").as_str())
+        );
 
         // Switching back must update the title again, even though workspace A's
         // own computed title hasn't changed since it was last active. This is
@@ -19224,7 +19645,360 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1").as_str())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_project_theme_follows_active_workspace(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let registry = ThemeRegistry::global(cx);
+            let base_theme = registry.get("One Dark").unwrap();
+            let mut theme_a = (*base_theme).clone();
+            theme_a.id = "test-project-a".to_string();
+            theme_a.name = "Test Project A".into();
+            let mut theme_b = (*base_theme).clone();
+            theme_b.id = "test-project-b".to_string();
+            theme_b.name = "Test Project B".into();
+            registry.insert_themes([theme_a, theme_b]);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root1"), json!({ "a.txt": "" }))
+            .await;
+        fs.insert_tree(path!("/root2"), json!({ "b.txt": "" }))
+            .await;
+
+        let project_a = Project::test(fs.clone(), [path!("/root1").as_ref()], cx).await;
+        let project_b = Project::test(fs.clone(), [path!("/root2").as_ref()], cx).await;
+        let projectless = Project::test(fs, [], cx).await;
+        let worktree_a = project_a.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let worktree_b = project_b.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+        let workspace_a = multi_workspace_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
+
+        let database = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let key_a = workspace_a.read_with(cx, |workspace, cx| {
+            workspace.project_theme_key(worktree_a, cx).unwrap()
+        });
+        database
+            .set_project_theme(key_a.clone(), "Test Project A".into())
+            .await
+            .unwrap();
+
+        let item_a = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_project_items(&[TestProjectItem::new_in_worktree(1, "a.txt", worktree_a, cx)])
+        });
+        workspace_a.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item_a), None, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+
+        let workspace_b = multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project_b.clone(), window, cx)
+            })
+            .unwrap();
+        let key_b = workspace_b.read_with(cx, |workspace, cx| {
+            workspace.project_theme_key(worktree_b, cx).unwrap()
+        });
+        database
+            .set_project_theme(key_b, "Test Project B".into())
+            .await
+            .unwrap();
+        let item_b = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_project_items(&[TestProjectItem::new_in_worktree(2, "b.txt", worktree_b, cx)])
+        });
+        workspace_b.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item_b), None, true, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            theme_settings::set_active_project_theme(ThemeName("Test Project B".into()), cx);
+        });
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project B");
+
+        let projectless_workspace = multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(projectless, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.read(|cx| theme_settings::active_project_theme_name(cx).is_none()));
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "One Dark");
+        assert_eq!(
+            database
+                .project_theme(key_a.clone())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Test Project A")
+        );
+
+        multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace_a.clone(), None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+
+        multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(projectless_workspace, None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.read(|cx| theme_settings::active_project_theme_name(cx).is_none()));
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "One Dark");
+
+        multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace_b, None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project B");
+
+        multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace_a, None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+    }
+
+    #[gpui::test]
+    async fn test_new_window_applies_saved_project_theme_without_items(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            let registry = ThemeRegistry::global(cx);
+            let mut saved_theme = (*registry.get("One Dark").expect("base theme")).clone();
+            saved_theme.id = "saved-new-window-theme".into();
+            saved_theme.name = "Saved New Window Theme".into();
+            registry.insert_themes([saved_theme]);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/theme-startup-project"), json!({"file.rs": ""}))
+            .await;
+        let project = Project::test(fs, [path!("/theme-startup-project").as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        cx.run_until_parked();
+        let key = ProjectThemeKey {
+            remote_identity: String::new(),
+            worktree_root_path: path!("/theme-startup-project").into(),
+        };
+        let database = cx.update(|cx| WorkspaceDb::global(cx));
+        database
+            .set_project_theme(key.clone(), "Saved New Window Theme".into())
+            .await
+            .expect("save theme assignment");
+        assert_ne!(
+            cx.read(|cx| cx.theme().name.to_string()),
+            "Saved New Window Theme"
+        );
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.database_id().is_none());
+            assert!(workspace.active_item(cx).is_none());
+            assert!(workspace.selected_theme_worktree_root.is_none());
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key.clone()));
+        });
+        assert_eq!(
+            cx.read(|cx| cx.theme().name.to_string()),
+            "Saved New Window Theme"
+        );
+        assert_eq!(
+            database
+                .project_theme(key)
+                .await
+                .expect("read theme")
+                .as_deref(),
+            Some("Saved New Window Theme")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_project_theme_ignores_theme_passive_active_items(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let registry = ThemeRegistry::global(cx);
+            let base_theme = registry.get("One Dark").unwrap();
+            let mut theme_a = (*base_theme).clone();
+            theme_a.id = "test-project-a".to_string();
+            theme_a.name = "Test Project A".into();
+            let mut theme_b = (*base_theme).clone();
+            theme_b.id = "test-project-b".to_string();
+            theme_b.name = "Test Project B".into();
+            registry.insert_themes([theme_a, theme_b]);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root1"), json!({ "a.txt": "" }))
+            .await;
+        fs.insert_tree(path!("/root2"), json!({ "b.txt": "" }))
+            .await;
+
+        let project =
+            Project::test(fs, [path!("/root1").as_ref(), path!("/root2").as_ref()], cx).await;
+        let (worktree_a, worktree_b) = project.read_with(cx, |project, cx| {
+            let mut worktrees = project.worktrees(cx);
+            let worktree_a = worktrees.next().expect("first project worktree");
+            let worktree_b = worktrees.next().expect("second project worktree");
+            (worktree_a.read(cx).id(), worktree_b.read(cx).id())
+        });
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace");
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let database = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = database.next_id().await.expect("workspace id");
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+        let (key_a, key_b) = workspace.read_with(cx, |workspace, cx| {
+            (
+                workspace
+                    .project_theme_key(worktree_a, cx)
+                    .expect("first project theme key"),
+                workspace
+                    .project_theme_key(worktree_b, cx)
+                    .expect("second project theme key"),
+            )
+        });
+        database
+            .set_project_theme(key_a.clone(), "Test Project A".into())
+            .await
+            .unwrap();
+        database
+            .set_project_theme(key_b.clone(), "Test Project B".into())
+            .await
+            .unwrap();
+
+        let passive_project_item =
+            cx.update(|_, cx| TestProjectItem::new_in_worktree(2, "b.txt", worktree_b, cx));
+        let passive_path = passive_project_item.read_with(cx, |item, _| {
+            item.project_path.clone().expect("passive project path")
+        });
+        let passive_item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_project_items(&[passive_project_item])
+                .with_workspace_theme_affecting(false)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.invalidate_active_project_theme_resolution();
+            workspace.refresh_active_project_theme(cx);
+            workspace.add_item_to_active_pane(
+                Box::new(passive_item.clone()),
+                None,
+                true,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.clear_navigation_history(window, cx);
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key_a.clone()));
+            assert!(workspace.last_active_project_path.is_none());
+        });
+
+        let driver_a = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_project_items(&[TestProjectItem::new_in_worktree(1, "a.txt", worktree_a, cx)])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(driver_a), None, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&passive_item, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project A");
+        workspace.read_with(cx, |workspace, cx| {
+            let active_item = workspace.active_item(cx).expect("active passive item");
+            assert!(!active_item.affects_workspace_theme(cx));
+            assert_eq!(active_item.project_path(cx), Some(passive_path));
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key_a.clone()));
+        });
+
+        let driver_b = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_project_items(&[TestProjectItem::new_in_worktree(3, "b.txt", worktree_b, cx)])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(driver_b), None, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project B");
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.clear_navigation_history(window, cx);
+            workspace.activate_item(&passive_item, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project B");
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key_b.clone()));
+        });
+
+        let changed_path =
+            cx.update(|_, cx| TestProjectItem::new_in_worktree(4, "a.txt", worktree_a, cx));
+        passive_item.update(cx, |item, cx| {
+            item.project_items = vec![changed_path];
+            cx.emit(ItemEvent::UpdateTab);
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Project B");
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key_b.clone()));
+            assert_eq!(
+                workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx)),
+                workspace
+                    .project
+                    .read(cx)
+                    .find_project_path(path!("/root1/a.txt"), cx)
+            );
+        });
+
+        let app_state = workspace.read_with(cx, |workspace, _| workspace.app_state.clone());
+        let restored = workspace.update_in(cx, |_, window, cx| {
+            cx.new(|cx| Workspace::new(Some(workspace_id), project, app_state, window, cx))
+        });
+        restored.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_project_theme_key(cx), Some(key_b));
+            assert!(workspace.last_active_project_path.is_none());
+        });
     }
 
     #[gpui::test]
@@ -19246,7 +20020,10 @@ mod tests {
 
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root1"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root1").as_str())
+        );
 
         // Switch to workspace B; workspace A becomes a background workspace whose
         // event subscriptions are still live.
@@ -19256,7 +20033,10 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root2").as_str())
+        );
 
         // A title-affecting change in the background workspace A must not touch
         // the shared window's title, which belongs to the active workspace B.
@@ -19267,7 +20047,10 @@ mod tests {
             .await
             .unwrap();
         cx.run_until_parked();
-        assert_eq!(cx.window_title().as_deref(), Some("root2"));
+        assert_eq!(
+            cx.window_title().as_deref(),
+            Some(expected_window_title("root2").as_str())
+        );
     }
 
     fn pane_items_paths(pane: &Entity<Pane>, cx: &App) -> Vec<String> {
@@ -20253,5 +21036,34 @@ mod tests {
         fn set_zoomed(&mut self, zoomed: bool, _: &mut Window, _: &mut Context<Self>) {
             self.zoomed = zoomed;
         }
+    }
+    #[gpui::test]
+    async fn test_recent_navigation_history_excludes_legacy_directories(cx: &mut TestAppContext) {
+        init_test(cx);
+        let root = PathBuf::from(path!("/recent-path-project"));
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&root, json!({ "dir": {}, "file.rs": "" }))
+            .await;
+        let project = Project::test(fs, [root.as_path()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.persisted_recent_navigation_history =
+                vec![root.clone(), root.join("dir"), root.join("file.rs")];
+            assert!(!workspace.remember_navigation_history_path(
+                &ProjectPath {
+                    worktree_id,
+                    path: util::rel_path::RelPath::empty_arc()
+                },
+                cx
+            ));
+            let history = workspace.recent_navigation_history(None, cx);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].0.path.as_ref(), rel_path("file.rs"));
+        });
     }
 }

@@ -2,6 +2,12 @@ use gpui::{Context, Task};
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 use std::{path::PathBuf, sync::Arc};
 
+#[cfg(all(test, windows))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(windows)]
+use std::time::{Duration, Instant};
+
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
@@ -78,6 +84,10 @@ pub(crate) struct PtyProcessInfo {
     refresh_kind: ProcessRefreshKind,
     pid_getter: ProcessIdGetter,
     last_foreground_pid: Mutex<Option<Pid>>,
+    #[cfg(windows)]
+    last_process_discovery: Mutex<Option<(Instant, Pid)>>,
+    #[cfg(all(test, windows))]
+    process_discovery_count: AtomicUsize,
     pub(crate) current: RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
 }
@@ -109,6 +119,10 @@ impl PtyProcessInfo {
             refresh_kind: process_refresh_kind,
             pid_getter,
             last_foreground_pid: Mutex::new(None),
+            #[cfg(windows)]
+            last_process_discovery: Mutex::new(None),
+            #[cfg(all(test, windows))]
+            process_discovery_count: AtomicUsize::new(0),
             current: RwLock::new(None),
             task: Mutex::new(None),
         }
@@ -119,9 +133,40 @@ impl PtyProcessInfo {
     }
 
     fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
-        let pid = self.pid_getter.pid()?;
         let fallback_pid = self.pid_getter.fallback_pid();
         let mut system = self.system.write();
+
+        #[cfg(windows)]
+        let pid = {
+            const PROCESS_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
+            let mut last_process_discovery = self.last_process_discovery.lock();
+            if let Some((discovered_at, pid)) = *last_process_discovery
+                && discovered_at.elapsed() < PROCESS_DISCOVERY_INTERVAL
+            {
+                pid
+            } else {
+                #[cfg(test)]
+                self.process_discovery_count.fetch_add(1, Ordering::Relaxed);
+                let mut discovery = System::new();
+                discovery.refresh_processes_specifics(
+                    ProcessesToUpdate::All,
+                    true,
+                    ProcessRefreshKind::nothing().without_tasks(),
+                );
+                let pid = discovery
+                    .processes()
+                    .iter()
+                    .filter(|(_, process)| process.parent() == Some(fallback_pid))
+                    .max_by_key(|(_, process)| process.start_time())
+                    .map(|(pid, _)| *pid)
+                    .unwrap_or(fallback_pid);
+                *last_process_discovery = Some((Instant::now(), pid));
+                pid
+            }
+        };
+        #[cfg(not(windows))]
+        let pid = self.pid_getter.pid()?;
+
         // sysinfo never evicts processes that are absent from the refreshed pid
         // set, so entries for former foreground processes (each pinning an open
         // `/proc/<pid>/stat` handle on Linux) would otherwise accumulate for as
@@ -154,9 +199,18 @@ impl PtyProcessInfo {
         unsafe { libc::killpg(pid.as_u32() as i32, libc::SIGKILL) == 0 }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub(crate) fn kill_current_process(&self) -> bool {
-        self.refresh().is_some_and(|process| process.kill())
+        let Some(pid) = self.pid_getter.pid() else {
+            return false;
+        };
+        let mut system = self.system.write();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            self.refresh_kind,
+        );
+        system.process(pid).is_some_and(|process| process.kill())
     }
 
     pub(crate) fn kill_child_process(&self) -> bool {
@@ -191,7 +245,7 @@ impl PtyProcessInfo {
         Some(info)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn load_for_test(&self) -> Option<ProcessInfo> {
         self.load()
     }
@@ -240,6 +294,23 @@ impl PtyProcessInfo {
 
     pub(crate) fn pid(&self) -> Option<Pid> {
         self.pid_getter.pid()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn process_discovery_is_throttled_and_retained_map_stays_bounded() {
+        let info = PtyProcessInfo::new(ProcessIdGetter::new(-1, std::process::id()));
+
+        for _ in 0..20 {
+            info.load_for_test();
+        }
+
+        assert_eq!(info.process_discovery_count.load(Ordering::Relaxed), 1);
+        assert!(info.system.read().processes().len() <= 2);
     }
 }
 

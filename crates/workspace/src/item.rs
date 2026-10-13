@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use ui::{Color, Icon, IntoElement, Label, LabelCommon};
+use ui::{Color, Icon, Indicator, IntoElement, Label, LabelCommon};
 use util::ResultExt;
 
 pub const LEADER_UPDATE_THROTTLE: Duration = Duration::from_millis(200);
@@ -196,6 +196,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         None
     }
 
+    fn tab_indicator(&self, _cx: &App) -> Option<Indicator> {
+        None
+    }
+
     /// Returns the tab tooltip text.
     ///
     /// Use this if you don't need to customize the tab tooltip content.
@@ -257,6 +261,15 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
             result = item.project_path(cx);
         });
         result
+    }
+
+    /// Whether this item's project path may select the workspace-wide theme.
+    ///
+    /// Items can still report a project path for association, restoration, and
+    /// per-item settings while returning `false` here when their changing
+    /// state must not change the whole window's theme.
+    fn affects_workspace_theme(&self, _cx: &App) -> bool {
+        true
     }
 
     fn set_nav_history(&mut self, _: ItemNavHistory, _window: &mut Window, _: &mut Context<Self>) {}
@@ -409,12 +422,26 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
 pub trait SerializableItem: Item {
     fn serialized_item_kind() -> &'static str;
 
+    fn persistent_item_id(&self) -> Option<crate::PersistentItemId> {
+        None
+    }
+
     fn cleanup(
         workspace_id: WorkspaceId,
         alive_items: Vec<ItemId>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>>;
+
+    fn cleanup_with_persistent_item_ids(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _persistent_item_ids: Vec<crate::PersistentItemId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        Self::cleanup(workspace_id, alive_items, window, cx)
+    }
 
     fn deserialize(
         _project: Entity<Project>,
@@ -424,6 +451,18 @@ pub trait SerializableItem: Item {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Task<Result<Entity<Self>>>;
+
+    fn deserialize_with_persistent_item_id(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        _persistent_item_id: Option<crate::PersistentItemId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        Self::deserialize(project, workspace, workspace_id, item_id, window, cx)
+    }
 
     fn serialize(
         &mut self,
@@ -438,6 +477,7 @@ pub trait SerializableItem: Item {
 
 pub trait SerializableItemHandle: ItemHandle {
     fn serialized_item_kind(&self) -> &'static str;
+    fn persistent_item_id(&self, cx: &App) -> Option<crate::PersistentItemId>;
     fn serialize(
         &self,
         workspace: &mut Workspace,
@@ -453,6 +493,10 @@ where
 {
     fn serialized_item_kind(&self) -> &'static str {
         T::serialized_item_kind()
+    }
+
+    fn persistent_item_id(&self, cx: &App) -> Option<crate::PersistentItemId> {
+        self.read(cx).persistent_item_id()
     }
 
     fn serialize(
@@ -485,6 +529,7 @@ pub trait ItemHandle: 'static + Send {
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
+    fn tab_indicator(&self, cx: &App) -> Option<Indicator>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent>;
     fn telemetry_event_text(&self, cx: &App) -> Option<&'static str>;
@@ -495,6 +540,7 @@ pub trait ItemHandle: 'static + Send {
         cx: &App,
     ) -> AnyElement;
     fn project_path(&self, cx: &App) -> Option<ProjectPath>;
+    fn affects_workspace_theme(&self, cx: &App) -> bool;
     fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]>;
     fn project_paths(&self, cx: &App) -> SmallVec<[ProjectPath; 3]>;
     fn project_item_model_ids(&self, cx: &App) -> SmallVec<[EntityId; 3]>;
@@ -641,6 +687,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).tab_icon(window, cx)
     }
 
+    fn tab_indicator(&self, cx: &App) -> Option<Indicator> {
+        self.read(cx).tab_indicator(cx)
+    }
+
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         self.read(cx).tab_tooltip_content(cx)
     }
@@ -667,6 +717,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn project_path(&self, cx: &App) -> Option<ProjectPath> {
         <T as Item>::active_project_path(self.read(cx), cx)
+    }
+
+    fn affects_workspace_theme(&self, cx: &App) -> bool {
+        <T as Item>::affects_workspace_theme(self.read(cx), cx)
     }
 
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings {
@@ -1463,6 +1517,7 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
+        pub affects_workspace_theme: bool,
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
@@ -1556,6 +1611,7 @@ pub mod test {
                 nav_history: None,
                 tab_descriptions: None,
                 tab_detail: Default::default(),
+                affects_workspace_theme: true,
                 workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
                 serialize: None,
@@ -1606,6 +1662,11 @@ pub mod test {
         pub fn with_project_items(mut self, items: &[Entity<TestProjectItem>]) -> Self {
             self.project_items.clear();
             self.project_items.extend(items.iter().cloned());
+            self
+        }
+
+        pub fn with_workspace_theme_affecting(mut self, affects_workspace_theme: bool) -> Self {
+            self.affects_workspace_theme = affects_workspace_theme;
             self
         }
 
@@ -1694,6 +1755,10 @@ pub mod test {
             self.buffer_kind
         }
 
+        fn affects_workspace_theme(&self, _: &App) -> bool {
+            self.affects_workspace_theme
+        }
+
         fn set_nav_history(
             &mut self,
             history: ItemNavHistory,
@@ -1756,6 +1821,7 @@ pub mod test {
                     nav_history: None,
                     tab_descriptions: None,
                     tab_detail: Default::default(),
+                    affects_workspace_theme: self.affects_workspace_theme,
                     workspace_id: self.workspace_id,
                     focus_handle: cx.focus_handle(),
                     serialize: None,

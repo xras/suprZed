@@ -30,12 +30,15 @@ pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod thread_import;
+mod thread_item;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
 
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+
+pub use ui::{AgentNotification, AgentNotificationEvent};
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -93,6 +96,7 @@ pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
+pub use thread_item::ThreadItem;
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
@@ -269,6 +273,7 @@ const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfill
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentThreadSource {
     AgentPanel,
+    CenterPane,
     GitPanel,
     Sidebar,
 }
@@ -277,6 +282,7 @@ impl AgentThreadSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AgentPanel => "agent_panel",
+            Self::CenterPane => "center_pane",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
         }
@@ -406,6 +412,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Starts a new agent thread in the center pane.
+        NewCenterThread,
     ]
 );
 
@@ -709,6 +717,9 @@ pub fn init(
         init_language_model_settings(cx);
     }
     agent_panel::init(cx);
+    cx.set_global(workspace::PaneNewItemMenuCallbacks {
+        additional_entries: thread_item::center_menu_entries,
+    });
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
@@ -1134,6 +1145,10 @@ mod tests {
                 "NewTerminalThread should be visible by default"
             );
             assert!(
+                !filter.is_hidden(&NewCenterThread),
+                "NewCenterThread should be visible by default"
+            );
+            assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),
                 "OpenSkillCreator should be visible by default"
             );
@@ -1175,6 +1190,10 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewTerminalThread),
                 "NewTerminalThread should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&NewCenterThread),
+                "NewCenterThread should be hidden when agent is disabled"
             );
             assert!(
                 filter.is_hidden(&zed_actions::assistant::OpenGlobalAgentsMdRules),
@@ -1251,6 +1270,10 @@ mod tests {
             assert!(
                 filter.is_hidden(&NewThread),
                 "NewThread should be hidden when AI is disabled"
+            );
+            assert!(
+                filter.is_hidden(&NewCenterThread),
+                "NewCenterThread should be hidden when AI is disabled"
             );
         });
     }

@@ -981,6 +981,11 @@ pub struct TerminalBuilder {
 }
 
 impl TerminalBuilder {
+    pub fn with_initial_working_directory(mut self, working_directory: Option<PathBuf>) -> Self {
+        self.terminal.initial_working_directory = working_directory;
+        self
+    }
+
     pub fn new_display_only(
         cursor_shape: SettingsCursorShape,
         alternate_scroll: AlternateScroll,
@@ -1028,6 +1033,11 @@ impl TerminalBuilder {
         let terminal = Terminal {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
+            initial_working_directory: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_working_directory: None,
+            #[cfg(any(test, feature = "test-support"))]
+            test_foreground_process_command_name: None,
             subprocess: None,
             completion_tx: None,
             term,
@@ -1318,6 +1328,11 @@ impl TerminalBuilder {
             let terminal = Terminal {
                 task,
                 terminal_type,
+                initial_working_directory: working_directory.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                test_working_directory: None,
+                #[cfg(any(test, feature = "test-support"))]
+                test_foreground_process_command_name: None,
                 subprocess,
                 completion_tx,
                 term,
@@ -1521,6 +1536,11 @@ enum TerminalType {
 
 pub struct Terminal {
     terminal_type: TerminalType,
+    initial_working_directory: Option<PathBuf>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_working_directory: Option<Option<PathBuf>>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_foreground_process_command_name: Option<String>,
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
@@ -2973,7 +2993,20 @@ impl Terminal {
         })
     }
 
+    pub fn initial_working_directory(&self) -> Option<&Path> {
+        self.initial_working_directory.as_deref()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_working_directory_for_test(&mut self, cwd: Option<PathBuf>) {
+        self.test_working_directory = Some(cwd);
+    }
+
     pub fn working_directory(&self) -> Option<PathBuf> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(cwd) = &self.test_working_directory {
+            return cwd.clone();
+        }
         if self.is_remote_terminal {
             // We can't yet reliably detect the working directory of a shell on the
             // SSH host. Until we can do that, it doesn't make sense to display
@@ -2984,14 +3017,21 @@ impl Terminal {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_foreground_process_command_name_for_test(&mut self, command_name: Option<String>) {
+        self.test_foreground_process_command_name = command_name;
+    }
+
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(command_name) = &self.test_foreground_process_command_name {
+            return Some(command_name.clone());
+        }
         match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info
-                .current
-                .read()
-                .as_ref()
-                .and_then(|process| foreground_process_command_from_argv(&process.argv)),
+            TerminalType::Pty { info, .. } => info.current.read().as_ref().and_then(|process| {
+                foreground_process_command_from_argv_and_name(&process.argv, Some(&process.name))
+            }),
             TerminalType::DisplayOnly => None,
         }
     }
@@ -3532,10 +3572,19 @@ fn normalize_path_command_name(command: &str) -> Option<String> {
     Some(command)
 }
 
+#[cfg(test)]
 fn foreground_process_command_from_argv(argv: &[String]) -> Option<String> {
+    foreground_process_command_from_argv_and_name(argv, None)
+}
+
+fn foreground_process_command_from_argv_and_name(
+    argv: &[String],
+    process_name: Option<&str>,
+) -> Option<String> {
     let command = argv
         .first()
-        .and_then(|command| normalize_path_command_name(command));
+        .and_then(|command| normalize_path_command_name(command))
+        .or_else(|| process_name.and_then(normalize_path_command_name));
 
     if !matches!(
         command.as_deref(),
@@ -3557,6 +3606,14 @@ fn normalize_script_command_name(argument: &str) -> Option<String> {
         .file_stem()
         .and_then(|file_stem| file_stem.to_str())
         .and_then(normalize_path_command_name)?;
+
+    if file_stem == "npm-loader" {
+        return path
+            .parent()
+            .and_then(|package_path| package_path.file_name())
+            .and_then(|package_name| package_name.to_str())
+            .and_then(normalize_path_command_name);
+    }
 
     if file_stem != "index" {
         return Some(file_stem);
@@ -3668,6 +3725,30 @@ pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
     .into()
 }
 
+const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
+    "agent",
+    "agy",
+    "aider",
+    "amp",
+    "claude",
+    "codex",
+    "copilot",
+    "crush",
+    "devin",
+    "droid",
+    "gemini",
+    "goose",
+    "grok",
+    "openhands",
+    "opencode",
+    "pi",
+    "qwen",
+];
+
+pub fn is_known_terminal_agent_command(command: &str) -> bool {
+    KNOWN_TERMINAL_AGENT_COMMANDS.contains(&command)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -3677,6 +3758,7 @@ mod tests {
         Cell, Content, IndexedCell, TerminalBounds, TerminalBuilder, content_index_for_mouse,
         rgb_for_index,
     };
+
     use collections::HashMap;
     use gpui::{
         ClipboardItem, Entity, Pixels, ScrollDelta, TestAppContext, VisualContext,
@@ -3791,6 +3873,28 @@ mod tests {
                 "/Users/me/private-project/scripts/customer-data-export.js".to_string(),
             ]),
             Some("customer-data-export".to_string())
+        );
+        assert_eq!(
+            foreground_process_command_from_argv_and_name(
+                &[
+                    r"C:\Program Files\nodejs\node.exe".to_string(),
+                    r"C:\Users\me\AppData\Roaming\npm/node_modules/@openai/codex/bin/codex.js"
+                        .to_string(),
+                ],
+                Some("node.exe"),
+            ),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            foreground_process_command_from_argv_and_name(
+                &[
+                    r"C:\Program Files\nodejs\node.exe".to_string(),
+                    r"C:\Users\me\AppData\Roaming\npm\node_modules\@github\copilot\npm-loader.js"
+                        .to_string(),
+                ],
+                Some("node.exe"),
+            ),
+            Some("copilot".to_string())
         );
     }
 
@@ -3944,6 +4048,81 @@ mod tests {
             assert!(terminal.replace_display_output(b"replacement", cx).is_err());
             assert!(terminal.get_content().contains("hello-from-subprocess"));
         });
+    }
+
+    #[gpui::test]
+    fn test_bel_parser_distinguishes_osc_terminators(cx: &mut TestAppContext) {
+        let terminal = init_terminal_test(cx, b"");
+        let bells = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            let bells = bells.clone();
+            cx.subscribe(&terminal, move |_, event: &Event, _| {
+                if matches!(event, Event::Bell) {
+                    bells.set(bells.get() + 1);
+                }
+            })
+        });
+        for chunk in [b"ordinary".as_slice(), b"\x1b]0;title", b"\x07"] {
+            terminal.update(cx, |terminal, cx| terminal.write_output(chunk, cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(bells.get(), 0);
+        for chunk in [b"\x07".as_slice(), b"text\x07", b"\x07"] {
+            terminal.update(cx, |terminal, cx| terminal.write_output(chunk, cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(bells.get(), 3);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    async fn test_windows_pty_delivers_delayed_bells(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let terminal = build_test_terminal_with_arguments(
+            cx,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_owned(),
+            vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "do { $line=[Console]::ReadLine() } while ($line -ne 'ready'); [Console]::Write([char]27+']0;probe'+[char]7); [Console]::Write([char]7); Start-Sleep -Milliseconds 50; [Console]::Write([char]7); [Console]::WriteLine('probe-finished'); $null=[Console]::ReadLine()".to_owned(),
+            ],
+        ).await;
+        let bells = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            let bells = bells.clone();
+            cx.subscribe(&terminal, move |_, event: &Event, _| {
+                if matches!(event, Event::Bell) {
+                    bells.set(bells.get() + 1);
+                }
+            })
+        });
+        terminal.update(cx, |terminal, _| terminal.write_to_pty(b"ready\r"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let finished = terminal.update(cx, |terminal, _| {
+                terminal.get_content().contains("probe-finished")
+            });
+            if finished && bells.get() == 2 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                terminal.update(cx, |terminal, _| terminal.kill_active_task());
+                panic!(
+                    "Windows PTY probe timed out; received {} Bells",
+                    bells.get()
+                );
+            }
+            // ConPTY IO runs outside the deterministic dispatcher.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(bells.get(), 2);
+        terminal.update(cx, |terminal, _| terminal.write_to_pty(b"done\r"));
     }
 
     fn init_terminal_test(cx: &mut TestAppContext, output: &[u8]) -> Entity<Terminal> {

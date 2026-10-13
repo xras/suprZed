@@ -1,48 +1,66 @@
-# Zed
+# suprZed
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+suprZed is a personal fork of [Zed](https://zed.dev/). It adds features for working with AI tools and several projects.
+It is an unofficial fork. It is not an official Zed release.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Zed is a fast editor that I enjoy using for coding and working with agents. Thank you to the Zed team and contributors
+for building it and making its source available. Their work is the foundation of suprZed.
 
----
+## Goals
 
-### Installation
+The goal of these customisations is to fit suprZed to the way I use AI tools:
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+- Keep several agent conversations open beside code.
+- Use Agent CLI terminals and Zed's built-in agent tools in the same workspace.
+- Return to the same CLI conversations after restarting the editor.
+- Switch between projects and see which project each agent is working on.
+- See when an agent needs attention and clear the alert when I return to it.
 
-Other platforms are not yet available:
+I use these features in my daily work. I aim to keep them compatible with future Zed updates.
+I also add small quality-of-life improvements. I aim to keep changes small and simple to maintain.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+## Why a fork?
 
-### Developing Zed
+A fork lets me build these features and use them in my daily work. Other people can try them too.
+Working examples may help explain the ideas. They may also support proposals to add some of them to Zed.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+[Zed PR #64059](https://github.com/zed-industries/zed/pull/64059) explored agent conversations as regular tabs.
+It was closed before the design was settled. The maintainers asked for new features to be discussed before implementation.
+This fork gives me a place to try related ideas.
 
-### Contributing
+## Features
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+See [suprZed-features.md](suprZed-features.md) for the features and how to use them.
+See [suprZed-features-implementation.md](suprZed-features-implementation.md) for a map of the code changes.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+## Building
 
-### Licensing
+suprZed is available as source code only. You must build it yourself.
+No prebuilt binaries or GitHub releases are planned.
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+See the [build guide](suprzed-docs/building.md) for instructions.
+suprZed currently supports Windows only. Linux and macOS are not supported or validated by this fork.
 
-License information for third party dependencies must be correctly provided for CI to pass.
+## Issues and contributions
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+Bug reports and feature suggestions are welcome through this repository's Issues tab.
+Please check existing issues before opening a new one.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+External pull requests are not accepted initially. Code changes and merges remain under my control.
+Discussions and the wiki will be disabled for the public fork. See [CONTRIBUTING.md](CONTRIBUTING.md) for reporting guidance.
 
-## Sponsorship
+## Maintenance
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+This is a personal development fork. I update it when time permits.
+I merge upstream Zed changes manually. I test those updates locally before merging them into main.
+GitHub Actions will be disabled for the public fork.
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+There is no fixed release schedule or commitment to provide community support.
+
+## Upstream project and licences
+
+See the [original Zed README](README-zed.md) for upstream project information.
+See the [original contribution guide](CONTRIBUTING-zed.md) for contributions to Zed itself.
+Upstream download links install Zed.
+
+The upstream licence files and notices remain in this repository.

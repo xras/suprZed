@@ -253,6 +253,21 @@ impl Default for SerializedPaneGroup {
 }
 
 impl SerializedPaneGroup {
+    pub(crate) fn item_counts_by_kind(&self, counts: &mut collections::HashMap<Arc<str>, usize>) {
+        match self {
+            Self::Group { children, .. } => {
+                for child in children {
+                    child.item_counts_by_kind(counts);
+                }
+            }
+            Self::Pane(pane) => {
+                for item in &pane.children {
+                    *counts.entry(item.kind.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+
     #[async_recursion(?Send)]
     pub(crate) async fn deserialize(
         self,
@@ -372,6 +387,7 @@ impl SerializedPane {
                     workspace.clone(),
                     workspace_id,
                     item.item_id,
+                    item.persistent_item_id.clone(),
                     window,
                     cx,
                 )
@@ -430,10 +446,24 @@ pub type GroupId = i64;
 pub type PaneId = i64;
 pub type ItemId = u64;
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub struct PersistentItemId(Arc<str>);
+
+impl PersistentItemId {
+    pub fn new(value: impl Into<Arc<str>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SerializedItem {
     pub kind: Arc<str>,
     pub item_id: ItemId,
+    pub persistent_item_id: Option<PersistentItemId>,
     pub active: bool,
     pub preview: bool,
 }
@@ -443,6 +473,7 @@ impl SerializedItem {
         Self {
             kind: Arc::from(kind.as_ref()),
             item_id,
+            persistent_item_id: None,
             active,
             preview,
         }
@@ -455,6 +486,7 @@ impl Default for SerializedItem {
         SerializedItem {
             kind: Arc::from("Terminal"),
             item_id: 100000,
+            persistent_item_id: None,
             active: false,
             preview: false,
         }
@@ -463,13 +495,20 @@ impl Default for SerializedItem {
 
 impl StaticColumnCount for SerializedItem {
     fn column_count() -> usize {
-        4
+        5
     }
 }
 impl Bind for &SerializedItem {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let next_index = statement.bind(&self.kind, start_index)?;
         let next_index = statement.bind(&self.item_id, next_index)?;
+        let next_index = statement.bind(
+            &self
+                .persistent_item_id
+                .as_ref()
+                .map(PersistentItemId::as_str),
+            next_index,
+        )?;
         let next_index = statement.bind(&self.active, next_index)?;
         statement.bind(&self.preview, next_index)
     }
@@ -479,12 +518,14 @@ impl Column for SerializedItem {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (kind, next_index) = Arc::<str>::column(statement, start_index)?;
         let (item_id, next_index) = ItemId::column(statement, next_index)?;
+        let (persistent_item_id, next_index) = Option::<String>::column(statement, next_index)?;
         let (active, next_index) = bool::column(statement, next_index)?;
         let (preview, next_index) = bool::column(statement, next_index)?;
         Ok((
             SerializedItem {
                 kind,
                 item_id,
+                persistent_item_id: persistent_item_id.map(PersistentItemId::new),
                 active,
                 preview,
             },

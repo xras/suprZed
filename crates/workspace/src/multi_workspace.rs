@@ -1357,6 +1357,8 @@ impl MultiWorkspace {
         // workspace (which is now the chrome owner per `owns_window_chrome`).
         workspace.update(cx, |workspace, cx| {
             workspace.refresh_window_state(window, cx);
+            workspace.invalidate_active_project_theme_resolution();
+            workspace.refresh_active_project_theme(cx);
         });
 
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });

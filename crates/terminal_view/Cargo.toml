@@ -36,14 +36,17 @@ task.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
 shlex.workspace = true
 terminal.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+tiny_http.workspace = true
 ui.workspace = true
 util.workspace = true
+uuid.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
@@ -58,3 +61,7 @@ rpc = { workspace = true, features = ["test-support"] }
 semver.workspace = true
 terminal = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+sysinfo.workspace = true
+windows.workspace = true

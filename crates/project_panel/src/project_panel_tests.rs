@@ -29,6 +29,246 @@ use workspace::{
     register_project_item,
 };
 
+fn quick_folder_key(remote: &str, root: &str, relative: &str) -> QuickFolderKey {
+    QuickFolderKey {
+        remote_identity: remote.to_owned(),
+        worktree_root_path: root.into(),
+        relative_path: relative.to_owned(),
+    }
+}
+
+#[test]
+fn test_quick_folder_ordering_limits_and_identity() {
+    let mut quick_folders = QuickFolders::default();
+    let first = quick_folder_key("", "/project-a", "src");
+    assert!(quick_folders.record_recent(first.clone()));
+    assert!(quick_folders.pin(first.clone()));
+
+    for index in 0..6 {
+        quick_folders.record_recent(quick_folder_key(
+            "",
+            "/project-a",
+            &format!("recent-{index}"),
+        ));
+    }
+    for index in 0..7 {
+        assert!(quick_folders.pin(quick_folder_key(
+            "",
+            "/project-a",
+            &format!("pinned-{index}"),
+        )));
+    }
+    assert!(!quick_folders.pin(quick_folder_key("", "/project-a", "ninth")));
+
+    let visible = quick_folders.visible();
+    assert_eq!(visible.iter().filter(|(_, pinned)| *pinned).count(), 8);
+    assert_eq!(visible.iter().filter(|(_, pinned)| !*pinned).count(), 4);
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|(_, pinned)| !*pinned)
+            .map(|(key, _)| key.relative_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["recent-5", "recent-4", "recent-3", "recent-2"]
+    );
+    assert_eq!(visible.iter().filter(|(key, _)| *key == &first).count(), 1);
+
+    let same_relative_other_root = quick_folder_key("", "/project-b", "src");
+    let same_relative_remote = quick_folder_key("ssh:user@example.com:22", "/project-a", "src");
+    assert_ne!(first, same_relative_other_root);
+    assert_ne!(first, same_relative_remote);
+
+    assert!(quick_folders.record_recent(first.clone()));
+    assert!(quick_folders.unpin(&first));
+    assert!(
+        quick_folders
+            .visible()
+            .iter()
+            .any(|(key, pinned)| { *key == &first && !*pinned })
+    );
+}
+
+#[test]
+fn test_quick_folder_record_round_trip() {
+    let mut quick_folders = QuickFolders::default();
+    let pinned = quick_folder_key("wsl:me@Ubuntu", "/workspace", "src");
+    let recent = quick_folder_key("wsl:me@Ubuntu", "/workspace", "tests");
+    quick_folders.record_recent(pinned.clone());
+    quick_folders.record_recent(recent.clone());
+    quick_folders.pin(pinned.clone());
+
+    let restored = QuickFolders::from_records(quick_folders.records());
+    assert_eq!(restored.pinned, vec![pinned.clone()]);
+    assert_eq!(restored.recent, vec![recent, pinned]);
+}
+
+#[gpui::test]
+async fn test_quick_folder_pin_menu_uses_folded_sub_entry(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                auto_fold_dirs: true,
+                ..*ProjectPanelSettings::get_global(cx)
+            },
+            cx,
+        );
+    });
+    let (panel, mut cx) = open_panel_with_tree(
+        json!({"a": {"b": {"c": {"file.rs": ""}}}, "other.rs": ""}),
+        size(px(800.), px(600.)),
+        cx,
+    )
+    .await;
+    let cx = &mut cx;
+    let leaf_id = find_project_entry(&panel, "root/a/b/c", cx).expect("folded leaf");
+    let key = quick_folder_key("", path!("/root"), "a/b");
+    for (menu_label, should_be_pinned) in [
+        ("MENU_ITEM-Pin to Quick Folders", true),
+        ("MENU_ITEM-Unpin from Quick Folders", false),
+    ] {
+        select_folded_path_with_mark(&panel, "root/a/b/c", "root/a/b", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.marked_entries.clear();
+            panel.deploy_context_menu(
+                ContextMenuPlacement::AtMouse(point(px(40.), px(40.))),
+                leaf_id,
+                window,
+                cx,
+            );
+            assert_eq!(
+                panel
+                    .selected_entry(cx)
+                    .expect("selected entry")
+                    .1
+                    .path
+                    .as_unix_str(),
+                "a/b/c"
+            );
+            assert_eq!(
+                panel
+                    .selected_sub_entry(cx)
+                    .expect("context menu entry")
+                    .1
+                    .path
+                    .as_unix_str(),
+                "a/b"
+            );
+        });
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds(menu_label)
+            .expect("correct pin state must be presented by the menu");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.quick_folders.pinned.len(),
+                usize::from(should_be_pinned),
+                "menu action must execute"
+            );
+            assert_eq!(panel.quick_folders.pinned.contains(&key), should_be_pinned);
+            assert!(!panel.quick_folders.pinned.contains(&quick_folder_key(
+                "",
+                path!("/root"),
+                "a/b/c"
+            )));
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_quick_folders_scroll_without_starving_short_tree(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                sticky_scroll: true,
+                ..*ProjectPanelSettings::get_global(cx)
+            },
+            cx,
+        );
+    });
+    for height in [160., 400., 600.] {
+        let mut folders = serde_json::Map::new();
+        for index in 0..12 {
+            folders.insert(format!("folder-{index:02}"), json!({"file.rs": ""}));
+        }
+        for index in 0..40 {
+            folders.insert(format!("file-{index:02}.rs"), json!(""));
+        }
+        let (panel, mut window_cx) = open_panel_with_tree(
+            serde_json::Value::Object(folders),
+            size(px(800.), px(height)),
+            cx,
+        )
+        .await;
+        let cx = &mut window_cx;
+        panel.update(cx, |panel, cx| {
+            for index in 0..12 {
+                let key = quick_folder_key("", path!("/root"), &format!("folder-{index:02}"));
+                if index < 8 {
+                    assert!(panel.quick_folders.pin(key));
+                } else {
+                    assert!(panel.quick_folders.record_recent(key));
+                }
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let quick_bounds = cx
+            .debug_bounds("QUICK_FOLDERS")
+            .expect("quick folders rendered");
+        let (tree_viewport, scroll) = panel.read_with(cx, |panel, cx| {
+            let entries = panel.resolved_quick_folders(cx);
+            assert_eq!(entries.len(), 12);
+            assert!(entries[..8].iter().all(|entry| entry.3));
+            assert!(entries[8..].iter().all(|entry| !entry.3));
+            (
+                panel.scroll_handle.viewport(),
+                panel.quick_folders_scroll_handle.clone(),
+            )
+        });
+        assert!(
+            tree_viewport.size.height >= quick_bounds.size.height * 3.,
+            "tree must retain at least three quarters of available list space: {tree_viewport:?}, {quick_bounds:?}"
+        );
+        assert!(
+            tree_viewport.size.height >= px(84.),
+            "short tree must fit sticky ancestors and a row"
+        );
+        assert!(
+            scroll.max_offset().y > px(0.),
+            "all twelve folders must be scrollable"
+        );
+        scroll.set_offset(point(px(0.), -scroll.max_offset().y));
+        panel.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        let last_bounds = cx
+            .debug_bounds("QUICK_FOLDER_11")
+            .expect("last recent folder rendered");
+        assert!(last_bounds.top() >= quick_bounds.top());
+        assert!(last_bounds.bottom() <= quick_bounds.bottom());
+        toggle_expand_dir(&panel, "root/folder-11", cx);
+        select_path(&panel, "root/folder-11/file.rs", cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.scroll_cursor_center(&ScrollCursorCenter, window, cx)
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let entry_id = panel.selection.expect("tree file selected").entry_id;
+            let bounds = entry_row_bounds(panel, entry_id);
+            let viewport = panel.scroll_handle.viewport();
+            assert!(
+                bounds.top()
+                    >= viewport.top()
+                        + panel.entry_row_height().expect("row height") * panel.sticky_items_count
+            );
+            assert!(bounds.bottom() <= viewport.bottom());
+        });
+    }
+}
+
 #[gpui::test]
 async fn test_visible_list(cx: &mut gpui::TestAppContext) {
     init_test(cx);

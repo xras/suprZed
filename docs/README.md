@@ -24,6 +24,8 @@ nix develop -c mdbook build docs
 (When `actions.json` has not been generated, action/keybinding validation is
 skipped with a warning rather than failing the build.)
 
+The Cargo dependency, Nix development shell, and docs CI workflows use mdBook 0.4.40. Keep the shared workflow installer in `tooling/xtask/src/tasks/workflows/deploy_docs.rs` and its generated workflows aligned when changing this version.
+
 It's important to note the version number above. For an unknown reason, as of 2025-04-23, running 0.4.48 will cause odd URL behavior that breaks things.
 
 Before committing, verify that the docs are formatted in the way Prettier expects with:

@@ -66,6 +66,13 @@ impl Connection {
         Self::open(uri, true).unwrap_or_else(|_| Self::open_memory(Some(uri)))
     }
 
+    pub fn open_file_read_only(uri: &str) -> Result<Self> {
+        let connection =
+            Self::open_with_flags(uri, true, SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_READONLY)?;
+        *connection.write.borrow_mut() = false;
+        Ok(connection)
+    }
+
     pub fn open_memory(uri: Option<&str>) -> Self {
         if let Some(uri) = uri {
             let in_memory_path = format!("file:{}?mode=memory&cache=shared", uri);

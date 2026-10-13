@@ -24,9 +24,9 @@ use gpui::{
     FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, ParentElement, PathPromptOptions, Pixels, Point,
-    PromptLevel, Render, ScrollStrategy, Stateful, Styled, Subscription, Task,
+    PromptLevel, Render, ScrollHandle, ScrollStrategy, Stateful, Styled, Subscription, Task,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, div, hsla,
-    linear_color_stop, linear_gradient, point, px, size, transparent_white, uniform_list,
+    linear_color_stop, linear_gradient, point, px, relative, size, transparent_white, uniform_list,
 };
 use itertools::Itertools;
 use language::DiagnosticSeverity;
@@ -41,6 +41,7 @@ use project::{
 };
 use project_panel_settings::ProjectPanelSettings;
 use rayon::slice::ParallelSliceMut;
+use remote::remote_connection_identity;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -53,6 +54,7 @@ use std::{
     cell::OnceCell,
     cmp,
     collections::HashSet,
+    mem,
     ops::{Neg, Range},
     path::{Path, PathBuf},
     sync::Arc,
@@ -73,7 +75,8 @@ use util::{
 };
 use workspace::{
     DraggedSelection, OpenInTerminal, OpenMode, OpenOptions, OpenVisible, PreviewTabsSettings,
-    SelectedEntry, SplitDirection, Workspace, WorkspaceSettings, copy_file_permalink,
+    QuickFolderRecord, SelectedEntry, SplitDirection, Workspace, WorkspaceDb, WorkspaceSettings,
+    copy_file_permalink,
     dock::{DockPosition, Panel, PanelEvent},
     focus_follows_mouse::FocusFollowsMouse as _,
     notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
@@ -92,6 +95,107 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+const MAX_PINNED_QUICK_FOLDERS: usize = 8;
+const MAX_RECENT_QUICK_FOLDERS: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct QuickFolderKey {
+    remote_identity: String,
+    worktree_root_path: PathBuf,
+    relative_path: String,
+}
+
+#[derive(Default)]
+struct QuickFolders {
+    pinned: Vec<QuickFolderKey>,
+    recent: Vec<QuickFolderKey>,
+}
+
+impl QuickFolders {
+    fn from_records(records: Vec<QuickFolderRecord>) -> Self {
+        let mut quick_folders = Self::default();
+        for record in records {
+            let key = QuickFolderKey {
+                remote_identity: record.remote_identity,
+                worktree_root_path: record.worktree_root_path,
+                relative_path: record.relative_path,
+            };
+            let entries = if record.is_pinned {
+                &mut quick_folders.pinned
+            } else {
+                &mut quick_folders.recent
+            };
+            if !entries.contains(&key) {
+                entries.push(key);
+            }
+        }
+        quick_folders.pinned.truncate(MAX_PINNED_QUICK_FOLDERS);
+        quick_folders.recent.truncate(MAX_RECENT_QUICK_FOLDERS);
+        quick_folders
+    }
+
+    fn records(&self) -> Vec<QuickFolderRecord> {
+        self.pinned
+            .iter()
+            .enumerate()
+            .map(|(position, key)| key.to_record(true, position))
+            .chain(
+                self.recent
+                    .iter()
+                    .enumerate()
+                    .map(|(position, key)| key.to_record(false, position)),
+            )
+            .collect()
+    }
+
+    fn visible(&self) -> Vec<(&QuickFolderKey, bool)> {
+        self.pinned
+            .iter()
+            .map(|key| (key, true))
+            .chain(
+                self.recent
+                    .iter()
+                    .filter(|key| !self.pinned.contains(key))
+                    .take(MAX_RECENT_QUICK_FOLDERS)
+                    .map(|key| (key, false)),
+            )
+            .collect()
+    }
+
+    fn pin(&mut self, key: QuickFolderKey) -> bool {
+        if self.pinned.contains(&key) || self.pinned.len() >= MAX_PINNED_QUICK_FOLDERS {
+            return false;
+        }
+        self.pinned.push(key);
+        true
+    }
+
+    fn unpin(&mut self, key: &QuickFolderKey) -> bool {
+        let previous_len = self.pinned.len();
+        self.pinned.retain(|candidate| candidate != key);
+        self.pinned.len() != previous_len
+    }
+
+    fn record_recent(&mut self, key: QuickFolderKey) -> bool {
+        let unchanged = self.recent.first() == Some(&key);
+        self.recent.retain(|candidate| candidate != &key);
+        self.recent.insert(0, key);
+        self.recent.truncate(MAX_RECENT_QUICK_FOLDERS);
+        !unchanged
+    }
+}
+
+impl QuickFolderKey {
+    fn to_record(&self, is_pinned: bool, position: usize) -> QuickFolderRecord {
+        QuickFolderRecord {
+            remote_identity: self.remote_identity.clone(),
+            worktree_root_path: self.worktree_root_path.clone(),
+            relative_path: self.relative_path.clone(),
+            is_pinned,
+            position,
+        }
+    }
+}
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -165,6 +269,12 @@ pub struct ProjectPanel {
     last_reported_update: Instant,
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
+    quick_folders: QuickFolders,
+    quick_folders_scroll_handle: ScrollHandle,
+    quick_folders_loaded: bool,
+    pending_quick_folder_recents: Vec<QuickFolderKey>,
+    quick_folders_load_task: Task<()>,
+    quick_folders_save_task: Task<()>,
     state: State,
 }
 
@@ -449,6 +559,10 @@ actions!(
         OpenMarkdownPreview,
         /// Opens the context menu for the selected entry.
         OpenContextMenu,
+        /// Pins the selected folder in Quick Folders.
+        PinToQuickFolders,
+        /// Unpins the selected folder from Quick Folders.
+        UnpinFromQuickFolders,
     ]
 );
 
@@ -919,7 +1033,43 @@ impl ProjectPanel {
                     project.read(cx).is_via_collab(),
                     &cx,
                 ),
+                quick_folders: QuickFolders::default(),
+                quick_folders_scroll_handle: ScrollHandle::new(),
+                quick_folders_loaded: false,
+                pending_quick_folder_recents: Vec::new(),
+                quick_folders_load_task: Task::ready(()),
+                quick_folders_save_task: Task::ready(()),
             };
+            if let Some(workspace_id) = workspace.database_id() {
+                let database = WorkspaceDb::global(cx);
+                this.quick_folders_load_task = cx.spawn(async move |this, cx| {
+                    match database.quick_folders(workspace_id).await {
+                        Ok(records) => {
+                            this.update(cx, |this, cx| {
+                                this.quick_folders = QuickFolders::from_records(records);
+                                this.quick_folders_loaded = true;
+                                let pending = mem::take(&mut this.pending_quick_folder_recents);
+                                let mut changed = false;
+                                for key in pending {
+                                    changed |= this.quick_folders.record_recent(key);
+                                }
+                                if changed {
+                                    this.persist_quick_folders(cx);
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Err(error) => {
+                            log::error!("failed to load quick folders: {error:#}");
+                            this.update(cx, |this, _| this.quick_folders_loaded = true)
+                                .ok();
+                        }
+                    }
+                });
+            } else {
+                this.quick_folders_loaded = true;
+            }
             this.update_visible_entries(None, false, false, window, cx);
 
             this
@@ -1177,6 +1327,21 @@ impl ProjectPanel {
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
+            let quick_folder_key = is_dir.then(|| QuickFolderKey {
+                remote_identity: project
+                    .remote_connection_options(cx)
+                    .as_ref()
+                    .map(remote_connection_identity)
+                    .map(|identity| identity.persistence_key())
+                    .unwrap_or_default(),
+                worktree_root_path: worktree.abs_path().to_path_buf(),
+                relative_path: entry.path.as_unix_str().to_owned(),
+            });
+            let is_quick_folder_pinned = quick_folder_key
+                .as_ref()
+                .is_some_and(|key| self.quick_folders.pinned.contains(key));
+            let can_pin_quick_folder = self.quick_folders_loaded
+                && self.quick_folders.pinned.len() < MAX_PINNED_QUICK_FOLDERS;
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
@@ -1185,6 +1350,22 @@ impl ProjectPanel {
                         })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
+                        })
+                        .when(is_dir, |menu| {
+                            menu.separator()
+                                .when(is_quick_folder_pinned, |menu| {
+                                    menu.action(
+                                        "Unpin from Quick Folders",
+                                        Box::new(UnpinFromQuickFolders),
+                                    )
+                                })
+                                .when(!is_quick_folder_pinned, |menu| {
+                                    menu.action_disabled_when(
+                                        !can_pin_quick_folder,
+                                        "Pin to Quick Folders",
+                                        Box::new(PinToQuickFolders),
+                                    )
+                                })
                         })
                     } else {
                         menu.action("New File", Box::new(NewFile))
@@ -1206,6 +1387,24 @@ impl ProjectPanel {
                             .when(is_dir, |menu| {
                                 menu.separator()
                                     .action("Find in Folder…", Box::new(NewSearchInDirectory))
+                            })
+                            .when(is_dir, |menu| {
+                                menu.when(is_quick_folder_pinned, |menu| {
+                                    menu.action(
+                                        "Unpin from Quick Folders",
+                                        Box::new(UnpinFromQuickFolders),
+                                    )
+                                })
+                                .when(
+                                    !is_quick_folder_pinned,
+                                    |menu| {
+                                        menu.action_disabled_when(
+                                            !can_pin_quick_folder,
+                                            "Pin to Quick Folders",
+                                            Box::new(PinToQuickFolders),
+                                        )
+                                    },
+                                )
                             })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
@@ -1770,9 +1969,232 @@ impl ProjectPanel {
                 }
             });
             self.update_visible_entries(Some((worktree_id, entry_id)), false, false, window, cx);
+            self.record_quick_folder_recent(worktree_id, entry_id, cx);
             window.focus(&self.focus_handle, cx);
             cx.notify();
         }
+    }
+
+    fn quick_folder_key(
+        &self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &App,
+    ) -> Option<QuickFolderKey> {
+        let project = self.project.read(cx);
+        let worktree = project.worktree_for_id(worktree_id, cx)?;
+        let worktree = worktree.read(cx);
+        let entry = worktree.entry_for_id(entry_id)?;
+        entry.is_dir().then(|| QuickFolderKey {
+            remote_identity: project
+                .remote_connection_options(cx)
+                .as_ref()
+                .map(remote_connection_identity)
+                .map(|identity| identity.persistence_key())
+                .unwrap_or_default(),
+            worktree_root_path: worktree.abs_path().to_path_buf(),
+            relative_path: entry.path.as_unix_str().to_owned(),
+        })
+    }
+
+    fn record_quick_folder_recent(
+        &mut self,
+        worktree_id: WorktreeId,
+        entry_id: ProjectEntryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(key) = self.quick_folder_key(worktree_id, entry_id, cx) else {
+            return;
+        };
+        if !self.quick_folders_loaded {
+            self.pending_quick_folder_recents.push(key);
+            return;
+        }
+        if self.quick_folders.record_recent(key) {
+            self.persist_quick_folders(cx);
+            cx.notify();
+        }
+    }
+
+    fn persist_quick_folders(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).database_id())
+        else {
+            return;
+        };
+        let database = WorkspaceDb::global(cx);
+        let records = self.quick_folders.records();
+        let previous_save = mem::replace(&mut self.quick_folders_save_task, Task::ready(()));
+        self.quick_folders_save_task = cx.spawn(async move |_, _| {
+            previous_save.await;
+            if let Err(error) = database.set_quick_folders(workspace_id, records).await {
+                log::error!("failed to save quick folders: {error:#}");
+            }
+        });
+    }
+
+    fn pin_selected_quick_folder(
+        &mut self,
+        _: &PinToQuickFolders,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree_id, entry_id)) = self
+            .selected_sub_entry(cx)
+            .map(|(worktree, entry)| (worktree.read(cx).id(), entry.id))
+        else {
+            return;
+        };
+        let Some(key) = self.quick_folder_key(worktree_id, entry_id, cx) else {
+            return;
+        };
+        if self.quick_folders.pin(key) {
+            self.persist_quick_folders(cx);
+            cx.notify();
+        }
+    }
+
+    fn unpin_selected_quick_folder(
+        &mut self,
+        _: &UnpinFromQuickFolders,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree_id, entry_id)) = self
+            .selected_sub_entry(cx)
+            .map(|(worktree, entry)| (worktree.read(cx).id(), entry.id))
+        else {
+            return;
+        };
+        let Some(key) = self.quick_folder_key(worktree_id, entry_id, cx) else {
+            return;
+        };
+        if self.quick_folders.unpin(&key) {
+            self.persist_quick_folders(cx);
+            cx.notify();
+        }
+    }
+
+    fn resolved_quick_folders(
+        &self,
+        cx: &App,
+    ) -> Vec<(SelectedEntry, SharedString, SharedString, bool)> {
+        let project = self.project.read(cx);
+        let remote_identity = project
+            .remote_connection_options(cx)
+            .as_ref()
+            .map(remote_connection_identity)
+            .map(|identity| identity.persistence_key())
+            .unwrap_or_default();
+        self.quick_folders
+            .visible()
+            .into_iter()
+            .filter(|(key, _)| key.remote_identity == remote_identity)
+            .filter_map(|(key, is_pinned)| {
+                let relative_path = RelPath::from_unix_str(&key.relative_path).ok()?;
+                let worktree = project.visible_worktrees(cx).find(|worktree| {
+                    worktree.read(cx).abs_path().as_ref() == key.worktree_root_path
+                })?;
+                let worktree = worktree.read(cx);
+                let entry = worktree.entry_for_path(relative_path)?;
+                if !entry.is_dir() {
+                    return None;
+                }
+                let root_name = worktree.root_name_str();
+                let label = if key.relative_path.is_empty() {
+                    root_name.to_owned()
+                } else {
+                    format!("{root_name} / {}", key.relative_path)
+                };
+                let tooltip = worktree
+                    .absolutize(&entry.path)
+                    .to_string_lossy()
+                    .into_owned();
+                Some((
+                    SelectedEntry {
+                        worktree_id: worktree.id(),
+                        entry_id: entry.id,
+                    },
+                    label.into(),
+                    tooltip.into(),
+                    is_pinned,
+                ))
+            })
+            .collect()
+    }
+
+    fn activate_quick_folder(
+        &mut self,
+        selection: SelectedEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .reveal_entry(self.project.clone(), selection.entry_id, false, window, cx)
+            .is_ok()
+        {
+            self.record_quick_folder_recent(selection.worktree_id, selection.entry_id, cx);
+            window.focus(&self.focus_handle, cx);
+        }
+    }
+
+    fn render_quick_folders(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entries = self.resolved_quick_folders(cx);
+        (!entries.is_empty()).then(|| {
+            v_flex()
+                .id("quick-folders")
+                .debug_selector(|| "QUICK_FOLDERS".to_owned())
+                .w_full()
+                .max_h(relative(0.25))
+                .flex_shrink_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.quick_folders_scroll_handle)
+                .py_1()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    h_flex().h_6().flex_shrink_0().px_2().child(
+                        Label::new("Quick Folders")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .children(entries.into_iter().enumerate().map(
+                    |(index, (selection, label, tooltip, is_pinned))| {
+                        h_flex()
+                            .id(("quick-folder", index))
+                            .h_7()
+                            .flex_shrink_0()
+                            .debug_selector(move || format!("QUICK_FOLDER_{index}"))
+                            .px_2()
+                            .gap_2()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.activate_quick_folder(selection, window, cx);
+                            }))
+                            .child(
+                                Icon::new(if is_pinned {
+                                    IconName::Pin
+                                } else {
+                                    IconName::Folder
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(Label::new(label).size(LabelSize::Small).truncate()),
+                            )
+                    },
+                ))
+                .into_any_element()
+        })
     }
 
     fn toggle_expand_all(
@@ -7456,6 +7878,7 @@ impl Render for ProjectPanel {
         }
 
         let has_worktree = !self.state.visible_entries.is_empty();
+        let quick_folders = self.render_quick_folders(cx);
         let project = self.project.read(cx);
         let panel_settings = ProjectPanelSettings::get_global(cx);
         let indent_size = panel_settings.indent_size;
@@ -7606,6 +8029,8 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_vertical))
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
+                .on_action(cx.listener(Self::pin_selected_quick_folder))
+                .on_action(cx.listener(Self::unpin_selected_quick_folder))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
@@ -7651,6 +8076,7 @@ impl Render for ProjectPanel {
                 .track_focus(&self.focus_handle(cx))
                 .child(
                     v_flex()
+                        .children(quick_folders)
                         .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {

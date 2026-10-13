@@ -783,6 +783,7 @@ pub struct ConversationView {
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp_v1::SessionId>,
+    root_work_dirs: PathList,
     server_state: ServerState,
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
@@ -855,10 +856,28 @@ impl ConversationView {
             .map(|view| view.read(cx).thread.clone())
     }
 
+    pub(crate) fn root_work_dirs(&self, cx: &App) -> Option<PathList> {
+        self.root_thread(cx)
+            .and_then(|thread| thread.read(cx).work_dirs().cloned())
+            .or_else(|| {
+                let session_id = self.root_session_id.as_ref()?;
+                let store = ThreadMetadataStore::try_global(cx)?;
+                store
+                    .read(cx)
+                    .entry_by_session(session_id)
+                    .map(|metadata| metadata.folder_paths().clone())
+            })
+            .or_else(|| Some(self.root_work_dirs.clone()))
+    }
+
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {
         self.root_session_id
             .as_ref()
             .and_then(|id| self.thread_view(id))
+    }
+
+    pub(crate) fn project(&self) -> &Entity<Project> {
+        &self.project
     }
 
     pub fn thread_view(&self, session_id: &acp_v1::SessionId) -> Option<Entity<ThreadView>> {
@@ -904,11 +923,13 @@ impl ConversationView {
     }
 
     pub fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
+        self.root_work_dirs = work_dirs.clone();
         if let Some(connected) = self.as_connected() {
             connected.conversation.update(cx, |conversation, cx| {
                 conversation.set_work_dirs(work_dirs.clone(), cx);
             });
         }
+        cx.notify();
     }
 }
 
@@ -1047,6 +1068,7 @@ impl ConversationView {
         .detach();
 
         let thread_id = thread_id.unwrap_or_else(ThreadId::new);
+        let root_work_dirs = work_dirs.unwrap_or_else(|| project.read(cx).default_path_list(cx));
 
         Self {
             agent: agent.clone(),
@@ -1058,12 +1080,13 @@ impl ConversationView {
             thread_store,
             thread_id,
             root_session_id: resume_session_id.clone(),
+            root_work_dirs: root_work_dirs.clone(),
             server_state: Self::initial_state(
                 agent.clone(),
                 connection_store,
                 connection_key,
                 resume_session_id,
-                work_dirs,
+                Some(root_work_dirs),
                 title,
                 project,
                 initial_content,
@@ -1194,13 +1217,15 @@ impl ConversationView {
 
         self.clear_resolved_request_elicitations(cx);
         self.loading_status = None;
+        let work_dirs = work_dirs.unwrap_or_else(|| self.root_work_dirs.clone());
+        self.root_work_dirs = work_dirs.clone();
 
         let state = Self::initial_state(
             self.agent.clone(),
             self.connection_store.clone(),
             self.connection_key.clone(),
             resume_session_id,
-            work_dirs,
+            Some(work_dirs),
             title,
             self.project.clone(),
             None,
@@ -3123,7 +3148,29 @@ impl ConversationView {
         let multi_workspace = multi_workspace.read(cx);
         multi_workspace.sidebar_open() && multi_workspace.is_threads_list_view_active(cx)
             || multi_workspace.workspace() == &workspace
-                && self.is_visible_in_agent_panel(&workspace, cx)
+                && (self.is_visible_in_agent_panel(&workspace, cx)
+                    || self.is_visible_in_center(&workspace, cx))
+    }
+
+    fn is_visible_in_center(&self, workspace: &Entity<Workspace>, cx: &Context<Self>) -> bool {
+        let Some(item) = workspace
+            .read(cx)
+            .panel::<AgentPanel>(cx)
+            .and_then(|panel| panel.read(cx).center_thread_item(self.thread_id))
+        else {
+            return false;
+        };
+        let workspace = workspace.read(cx);
+        workspace.panes().iter().any(|pane| {
+            (!workspace.is_pane_maximized() || workspace.active_pane() == pane)
+                && workspace
+                    .zoomed_item()
+                    .is_none_or(|zoomed| zoomed == &pane.downgrade().into())
+                && pane
+                    .read(cx)
+                    .active_item()
+                    .is_some_and(|active| active.item_id() == item.entity_id())
+        })
     }
 
     fn is_visible_in_agent_panel(&self, workspace: &Entity<Workspace>, cx: &Context<Self>) -> bool {
@@ -3148,9 +3195,10 @@ impl ConversationView {
         if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
             self.is_visible(&multi_workspace, cx)
         } else {
-            self.workspace
-                .upgrade()
-                .is_some_and(|workspace| self.is_visible_in_agent_panel(&workspace, cx))
+            self.workspace.upgrade().is_some_and(|workspace| {
+                self.is_visible_in_agent_panel(&workspace, cx)
+                    || self.is_visible_in_center(&workspace, cx)
+            })
         }
     }
 
@@ -3160,9 +3208,10 @@ impl ConversationView {
             && if let Some(mw) = window.root::<MultiWorkspace>().flatten() {
                 self.is_visible(&mw, cx)
             } else {
-                self.workspace
-                    .upgrade()
-                    .is_some_and(|workspace| self.is_visible_in_agent_panel(&workspace, cx))
+                self.workspace.upgrade().is_some_and(|workspace| {
+                    self.is_visible_in_agent_panel(&workspace, cx)
+                        || self.is_visible_in_center(&workspace, cx)
+                })
             };
         let settings = AgentSettings::get_global(cx);
         if settings.play_sound_when_agent_done.should_play(visible) {
@@ -3304,24 +3353,35 @@ impl ConversationView {
                                                 cx,
                                             );
                                             workspace.update(cx, |workspace, cx| {
-                                                workspace.reveal_panel::<AgentPanel>(window, cx);
                                                 if let Some(panel) =
                                                     workspace.panel::<AgentPanel>(cx)
                                                 {
-                                                    panel.update(cx, |panel, cx| {
-                                                        panel.load_agent_thread(
-                                                            agent.clone(),
-                                                            root_thread_id,
-                                                            root_work_dirs.clone(),
-                                                            root_title.clone(),
-                                                            true,
-                                                            AgentThreadSource::AgentPanel,
-                                                            window,
-                                                            cx,
+                                                    if let Some(item) = panel
+                                                        .read(cx)
+                                                        .center_thread_item(root_thread_id)
+                                                    {
+                                                        workspace.activate_item(
+                                                            &item, true, true, window, cx,
                                                         );
-                                                    });
+                                                    } else {
+                                                        workspace
+                                                            .reveal_panel::<AgentPanel>(window, cx);
+                                                        panel.update(cx, |panel, cx| {
+                                                            panel.load_agent_thread(
+                                                                agent.clone(),
+                                                                root_thread_id,
+                                                                root_work_dirs.clone(),
+                                                                root_title.clone(),
+                                                                true,
+                                                                AgentThreadSource::AgentPanel,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                        workspace
+                                                            .focus_panel::<AgentPanel>(window, cx);
+                                                    }
                                                 }
-                                                workspace.focus_panel::<AgentPanel>(window, cx);
                                             });
                                         }
                                     })
@@ -3409,6 +3469,16 @@ impl ConversationView {
             self.notification_subscriptions.remove(&window);
         }
         had_notifications
+    }
+
+    pub(crate) fn dismiss_notifications_if_visible(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent_status_visible(window, cx) {
+            self.dismiss_notifications(cx);
+        }
     }
 
     fn agent_ui_font_size_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

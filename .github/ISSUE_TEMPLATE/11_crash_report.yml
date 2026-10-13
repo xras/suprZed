@@ -1,45 +1,41 @@
 name: Report a crash
-description: Zed is crashing or freezing or hanging.
-type: Crash
-labels: "state:needs triage"
+description: Report a crash, freeze or hang in suprZed.
 body:
-  - type: textarea
+  - type: markdown
     attributes:
-      label: Reproduction steps
-      description: A step-by-step description of how to reproduce the crash from a **clean Zed install**. The more context you provide, the easier it is to find and fix the problem fast.
-      placeholder: |
-        1. Start Zed
-        2. Perform an action
-        3. Zed crashes
-    validations:
-      required: true
-  - type: textarea
-    attributes:
-      label: Zed version and system specs
-      description: |
-        Open the command palette in Zed, then type “zed: copy system specs into clipboard”.
-      placeholder: |
-        Zed: v0.215.0 (Zed Nightly bfe141ea79aa4984028934067ba75c48d99136ae)
-        OS: macOS 15.1
-        Memory: 36 GiB
-        Architecture: aarch64
-    validations:
-      required: true
-  - type: textarea
-    attributes:
-      label: Attach Zed log file
-      description: |
-        Open the command palette in Zed, then type `zed: open log` to see the last 1000 lines. Or type `zed: reveal log in file manager` in the command palette to reveal the log file itself.
-
-        ⚠️ **Please review your log file for secrets (API keys, tokens, etc.) and partially or fully redact them before posting.**
       value: |
-        <details><summary>Zed.log</summary>
-
-        <!-- Paste your log inside the code block. -->
-        ```log
-
-        ```
-
-        </details>
+        Please check this repository's existing issues first.
+        Remove tokens, passwords, private paths and conversation content before posting.
+        This is a personal fork. There is no commitment to provide support.
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Explain how to reproduce the problem in suprZed.
     validations:
-      required: false
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened (crash, freeze or hang)
+      description: Describe what stopped working and any message shown. Mention whether the app closed or remained open.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and environment
+      description: |
+        Include the version from About and your operating system.
+        Use "zed: copy system specs into clipboard" in the command palette to copy system details.
+        Include the agent and its version for terminal problems.
+        Remove private information before posting.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant logs or screenshots
+      description: |
+        Use "zed: open log" in the command palette to find the editor log.
+        Remove tokens, passwords, private paths and conversation content before posting.

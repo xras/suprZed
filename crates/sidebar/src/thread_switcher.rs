@@ -6,8 +6,9 @@ use agent_ui::{
 };
 use gpui::{
     Action as _, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Modifiers,
-    ModifiersChangedEvent, Render, ScrollHandle, SharedString, prelude::*,
+    ModifiersChangedEvent, Render, ScrollHandle, SharedString, WeakEntity, prelude::*,
 };
+use terminal_view::TerminalView;
 use ui::{AgentThreadStatus, ThreadItem, ThreadItemWorktreeInfo, WithScrollbar, prelude::*};
 use workspace::{ModalView, Workspace};
 use zed_actions::agents_sidebar::ToggleThreadSwitcher;
@@ -35,6 +36,8 @@ pub(crate) struct ThreadSwitcherThreadEntry {
 pub(crate) struct ThreadSwitcherTerminalEntry {
     pub metadata: TerminalThreadMetadata,
     pub(super) workspace: ThreadEntryWorkspace,
+    pub(super) center_view: Option<WeakEntity<TerminalView>>,
+    pub icon: IconName,
     pub project_name: Option<SharedString>,
     pub worktrees: Vec<ThreadItemWorktreeInfo>,
     pub notified: bool,
@@ -56,6 +59,8 @@ pub(super) enum ThreadSwitcherSelection {
     Terminal {
         metadata: TerminalThreadMetadata,
         workspace: ThreadEntryWorkspace,
+        center_view: Option<WeakEntity<TerminalView>>,
+        icon: IconName,
     },
 }
 
@@ -69,6 +74,8 @@ impl ThreadSwitcherEntry {
             Self::Terminal(entry) => ThreadSwitcherSelection::Terminal {
                 metadata: entry.metadata.clone(),
                 workspace: entry.workspace.clone(),
+                center_view: entry.center_view.clone(),
+                icon: entry.icon,
             },
         }
     }
@@ -97,7 +104,7 @@ impl ThreadSwitcherEntry {
         match self {
             Self::Thread(entry) if entry.is_draft => IconName::Circle,
             Self::Thread(entry) => entry.icon,
-            Self::Terminal(_) => IconName::Terminal,
+            Self::Terminal(entry) => entry.icon,
         }
     }
 

@@ -115,7 +115,7 @@ jobs:
     - name: deploy_docs::install_mdbook
       uses: peaceiris/actions-mdbook@ee69d230fe19748b7abf22df32acaa93833fad08
       with:
-        mdbook-version: 0.4.37
+        mdbook-version: 0.4.40
     - name: deploy_docs::build_docs_book
       run: |
         mkdir -p target/deploy

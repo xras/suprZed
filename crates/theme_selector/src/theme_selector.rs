@@ -15,7 +15,10 @@ use theme_settings::{
 };
 use ui::{ListItem, ListItemSpacing, prelude::*, v_flex};
 use util::ResultExt;
-use workspace::{ModalView, Workspace, ui::HighlightedLabel, with_active_or_new_workspace};
+use workspace::{
+    ModalView, ProjectThemeKey, Workspace, WorkspaceDb, ui::HighlightedLabel,
+    with_active_or_new_workspace,
+};
 use zed_actions::{ExtensionCategoryFilter, Extensions};
 
 use crate::icon_theme_selector::{IconThemeSelector, IconThemeSelectorDelegate};
@@ -50,10 +53,14 @@ fn toggle_theme_selector(
     cx: &mut Context<Workspace>,
 ) {
     let fs = workspace.app_state().fs.clone();
-    workspace.toggle_modal(window, cx, |window, cx| {
+    let project_theme_key = workspace.active_project_theme_key(cx);
+    let workspace_handle = cx.entity().downgrade();
+    workspace.toggle_modal(window, cx, move |window, cx| {
         let delegate = ThemeSelectorDelegate::new(
             cx.entity().downgrade(),
+            workspace_handle,
             fs,
+            project_theme_key,
             toggle.themes_filter.as_ref(),
             cx,
         );
@@ -125,6 +132,7 @@ impl ThemeSelector {
 }
 
 struct ThemeSelectorDelegate {
+    workspace: WeakEntity<Workspace>,
     fs: Arc<dyn Fs>,
     themes: Vec<ThemeMeta>,
     matches: Vec<StringMatch>,
@@ -142,6 +150,7 @@ struct ThemeSelectorDelegate {
     /// and, if we used `unwrap_or(0)` as a fallback, the first theme in the
     /// list would be shown as "active".
     original_theme_id: Option<usize>,
+    project_theme: Option<(ProjectThemeKey, Option<ThemeName>)>,
     /// The currently selected new theme.
     new_theme: Arc<Theme>,
     selection_completed: bool,
@@ -153,13 +162,19 @@ struct ThemeSelectorDelegate {
 impl ThemeSelectorDelegate {
     fn new(
         selector: WeakEntity<ThemeSelector>,
+        workspace: WeakEntity<Workspace>,
         fs: Arc<dyn Fs>,
+        project_theme_key: Option<ProjectThemeKey>,
         themes_filter: Option<&Vec<String>>,
         cx: &mut Context<ThemeSelector>,
     ) -> Self {
         let original_theme = cx.theme().clone();
         let original_theme_settings = ThemeSettings::get_global(cx).clone();
         let original_system_appearance = SystemAppearance::global(cx).0;
+        let project_theme = project_theme_key.map(|key| {
+            let theme_name = theme_settings::active_project_theme_name(cx).cloned();
+            (key, theme_name)
+        });
 
         let registry = ThemeRegistry::global(cx);
         let mut themes = registry
@@ -204,12 +219,14 @@ impl ThemeSelectorDelegate {
             .unwrap_or(0);
 
         Self {
+            workspace,
             fs,
             themes,
             matches,
             original_theme_settings,
             original_system_appearance,
             original_theme_id,
+            project_theme,
             new_theme: original_theme, // Start with the original theme.
             selected_index,
             selection_completed: false,
@@ -249,23 +266,35 @@ impl ThemeSelectorDelegate {
 
     fn revert_theme(&mut self, cx: &mut App) {
         if !self.selection_completed {
-            SettingsStore::update_global(cx, |store, _| {
-                store.override_global(self.original_theme_settings.clone());
-            });
+            if let Some((_, theme_name)) = &self.project_theme {
+                if let Some(theme_name) = theme_name {
+                    theme_settings::set_active_project_theme(theme_name.clone(), cx);
+                } else {
+                    theme_settings::clear_active_project_theme(cx);
+                }
+            } else {
+                SettingsStore::update_global(cx, |store, _| {
+                    store.override_global(self.original_theme_settings.clone());
+                });
+            }
             self.selection_completed = true;
         }
     }
 
     fn set_theme(&mut self, new_theme: Arc<Theme>, cx: &mut App) {
-        // Update the global (in-memory) theme settings.
-        SettingsStore::update_global(cx, |store, _| {
-            override_global_theme(
-                store,
-                &new_theme,
-                &self.original_theme_settings.theme,
-                self.original_system_appearance,
-            )
-        });
+        if self.project_theme.is_some() {
+            theme_settings::set_active_project_theme(ThemeName(new_theme.name.clone().into()), cx);
+        } else {
+            // Update the global (in-memory) theme settings.
+            SettingsStore::update_global(cx, |store, _| {
+                override_global_theme(
+                    store,
+                    &new_theme,
+                    &self.original_theme_settings.theme,
+                    self.original_system_appearance,
+                )
+            });
+        }
 
         self.new_theme = new_theme;
     }
@@ -404,9 +433,34 @@ impl PickerDelegate for ThemeSelectorDelegate {
 
         telemetry::event!("Settings Changed", setting = "theme", value = theme_name);
 
-        update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            theme_settings::set_theme(settings, theme_name, theme_appearance, system_appearance);
-        });
+        if let Some((key, _)) = &self.project_theme {
+            let database = WorkspaceDb::global(cx);
+            let key = key.clone();
+            let theme_name = theme_name.to_string();
+            self.workspace
+                .update(cx, |workspace, _| {
+                    workspace.record_active_project_theme_assignment(
+                        key.clone(),
+                        ThemeName(theme_name.clone().into()),
+                    );
+                })
+                .ok();
+            cx.background_spawn(async move {
+                if let Err(error) = database.set_project_theme(key, theme_name).await {
+                    log::error!("failed to save project theme: {error:#}");
+                }
+            })
+            .detach();
+        } else {
+            update_settings_file(self.fs.clone(), cx, move |settings, _| {
+                theme_settings::set_theme(
+                    settings,
+                    theme_name,
+                    theme_appearance,
+                    system_appearance,
+                );
+            });
+        }
 
         self.selector
             .update(cx, |_, cx| {
@@ -576,7 +630,7 @@ mod tests {
     use project::Project;
     use serde_json::json;
     use theme::{Appearance, ThemeFamily, ThemeRegistry, default_color_scales};
-    use util::path;
+    use util::{path, rel_path::rel_path};
     use workspace::MultiWorkspace;
 
     fn init_test(cx: &mut TestAppContext) -> Arc<workspace::AppState> {
@@ -624,9 +678,25 @@ mod tests {
         app_state
             .fs
             .as_fake()
-            .insert_tree(path!("/test"), json!({}))
+            .insert_tree(path!("/test"), json!({ "file.rs": "" }))
             .await;
         app_state
+    }
+
+    #[gpui::test]
+    async fn setting_same_project_theme_does_not_reload(cx: &mut TestAppContext) {
+        setup_test(cx).await;
+        cx.update(|cx| {
+            theme_settings::set_active_project_theme(ThemeName("Test Dark A".into()), cx);
+        });
+        let before = cx.read(|cx| cx.theme().clone());
+
+        cx.update(|cx| {
+            theme_settings::set_active_project_theme(ThemeName("Test Dark A".into()), cx);
+        });
+        let after = cx.read(|cx| cx.theme().clone());
+
+        assert!(Arc::ptr_eq(&before, &after));
     }
 
     fn open_theme_selector(
@@ -713,6 +783,249 @@ mod tests {
             previewed_theme_name(&picker, cx),
             "Test Light",
             "previewed theme should be preserved after clearing an empty filter"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_missing_project_theme_escape_preserves_assignment_and_late_resolution(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = setup_test(cx).await;
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/missing-theme-test"), json!({ "file.rs": "" }))
+            .await;
+        let project = Project::test(
+            app_state.fs.clone(),
+            [path!("/missing-theme-test").as_ref()],
+            cx,
+        )
+        .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("file.rs")), None, true, window, cx)
+            })
+            .await
+            .expect("open file");
+        cx.run_until_parked();
+        let key = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_project_theme_key(cx)
+                .expect("project theme key")
+        });
+        let database = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let missing_name = "Late Project Theme";
+        database
+            .set_project_theme(key.clone(), missing_name.into())
+            .await
+            .expect("save missing assignment");
+        workspace.update(cx, |workspace, _| {
+            workspace
+                .record_active_project_theme_assignment(key.clone(), ThemeName(missing_name.into()))
+        });
+        cx.update(|_, cx| {
+            assert!(!theme_settings::set_active_project_theme(
+                ThemeName(missing_name.into()),
+                cx
+            ));
+            let cancel = cx
+                .build_action("menu::Cancel", None)
+                .expect("registered picker cancel action");
+            cx.bind_keys([gpui::KeyBinding::load(
+                "escape",
+                cancel,
+                None,
+                false,
+                None,
+                &gpui::DummyKeyboardMapper,
+            )
+            .expect("Escape binding")]);
+        });
+        let fallback_name = cx.read(|cx| cx.theme().name.to_string());
+        let picker = open_theme_selector(&workspace, cx);
+        let target_index = picker.read_with(cx, |picker, _| {
+            picker
+                .delegate
+                .matches
+                .iter()
+                .position(|theme| theme.string == "Test Light")
+                .expect("preview theme")
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_selected_index(target_index, None, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Light");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<ThemeSelector>(cx).is_none())
+        });
+        assert_eq!(
+            cx.read(|cx| theme_settings::active_project_theme_name(cx).cloned()),
+            Some(ThemeName(missing_name.into()))
+        );
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), fallback_name);
+        assert_eq!(
+            database
+                .project_theme(key.clone())
+                .await
+                .expect("stored assignment")
+                .as_deref(),
+            Some(missing_name)
+        );
+        cx.update(|_, cx| {
+            let registry = ThemeRegistry::global(cx);
+            let mut late_theme = (*registry.get("One Dark").expect("base theme")).clone();
+            late_theme.id = "late-project-theme".into();
+            late_theme.name = missing_name.into();
+            registry.insert_themes([late_theme]);
+            theme_settings::reload_theme(cx);
+        });
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), missing_name);
+        assert_eq!(
+            database
+                .project_theme(key)
+                .await
+                .expect("late stored assignment")
+                .as_deref(),
+            Some(missing_name)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_projectless_theme_selector_escape_restores_global_theme(cx: &mut TestAppContext) {
+        let app_state = setup_test(cx).await;
+        let project = Project::test(app_state.fs.clone(), None, cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.active_project_theme_key(cx).is_none()
+        }));
+        let original = cx.read(|cx| theme_settings::global_theme_name(cx));
+        cx.update(|_, cx| {
+            let cancel = cx
+                .build_action("menu::Cancel", None)
+                .expect("picker cancel action");
+            cx.bind_keys([gpui::KeyBinding::load(
+                "escape",
+                cancel,
+                None,
+                false,
+                None,
+                &gpui::DummyKeyboardMapper,
+            )
+            .expect("Escape binding")]);
+        });
+        let picker = open_theme_selector(&workspace, cx);
+        let target_index = picker.read_with(cx, |picker, _| {
+            picker
+                .delegate
+                .matches
+                .iter()
+                .position(|theme| theme.string == "Test Light")
+                .expect("preview theme")
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_selected_index(target_index, None, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.read(|cx| cx.theme().name.to_string()), "Test Light");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, cx| {
+            assert!(workspace.active_modal::<ThemeSelector>(cx).is_none())
+        });
+        assert_eq!(
+            cx.read(|cx| theme_settings::global_theme_name(cx)),
+            original
+        );
+        assert!(cx.read(|cx| theme_settings::active_project_theme_name(cx).is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_project_theme_preview_cancel_reverts_without_persisting(cx: &mut TestAppContext) {
+        let app_state = setup_test(cx).await;
+        let project = Project::test(app_state.fs.clone(), [path!("/test").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("file.rs")), None, true, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let key = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_project_theme_key(cx)
+                .expect("active project should have a theme key")
+        });
+        let database = cx.update(|_, cx| WorkspaceDb::global(cx));
+        database
+            .set_project_theme(key.clone(), "Test Dark A".into())
+            .await
+            .unwrap();
+        cx.update(|_, cx| {
+            theme_settings::set_active_project_theme(ThemeName("Test Dark A".into()), cx);
+        });
+
+        let picker = open_theme_selector(&workspace, cx);
+        let target_index = picker.read_with(cx, |picker, _| {
+            picker
+                .delegate
+                .matches
+                .iter()
+                .position(|theme| theme.string == "Test Light")
+                .unwrap()
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_selected_index(target_index, None, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| cx.theme().name.to_string()),
+            "Test Light",
+            "selecting a theme should preview it"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.hide_modal(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.read(|cx| cx.theme().name.to_string()),
+            "Test Dark A",
+            "dismissing the selector should restore the project theme"
+        );
+        assert_eq!(
+            database.project_theme(key).await.unwrap().as_deref(),
+            Some("Test Dark A"),
+            "previewing and cancelling must not persist the previewed theme"
         );
     }
 }

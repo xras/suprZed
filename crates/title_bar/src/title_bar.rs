@@ -354,6 +354,19 @@ impl Render for TitleBar {
 
         children.push(self.render_collaborator_list(window, cx).into_any_element());
 
+        children.push(
+            h_flex()
+                .absolute()
+                .inset_0()
+                .justify_center()
+                .child(
+                    Label::new("suprZed")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        );
+
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
                 children.push(banner.clone().into_any_element())
@@ -384,6 +397,12 @@ impl Render for TitleBar {
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
+                .child(
+                    Label::new(format!("PID{}", std::process::id()))
+                        .ml_2()
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error

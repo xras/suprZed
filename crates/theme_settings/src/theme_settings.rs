@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ::settings::{IntoGpui, Settings, SettingsStore};
 use anyhow::{Context as _, Result};
-use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
+use gpui::{App, BorrowAppContext, Font, Global, HighlightStyle, Pixels, Refineable, px};
 use gpui_util::ResultExt;
 use theme::{
     AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
@@ -41,6 +41,10 @@ pub use crate::settings::{
 pub use theme::UiDensity;
 
 struct ThemeSettingsProviderImpl;
+
+struct ActiveProjectTheme(Option<ThemeName>);
+
+impl Global for ActiveProjectTheme {}
 
 impl ThemeSettingsProvider for ThemeSettingsProviderImpl {
     fn ui_font<'a>(&'a self, cx: &'a App) -> &'a Font {
@@ -73,6 +77,7 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
 
     theme::init(themes_to_load, cx);
     theme::set_theme_settings_provider(Box::new(ThemeSettingsProviderImpl), cx);
+    cx.set_global(ActiveProjectTheme(None));
 
     if load_user_themes {
         let registry = ThemeRegistry::global(cx);
@@ -166,20 +171,63 @@ fn configured_theme(cx: &mut App) -> Arc<Theme> {
     let theme_settings = ThemeSettings::get_global(cx);
     let system_appearance = SystemAppearance::global(cx);
 
-    let theme_name = theme_settings.theme.name(*system_appearance);
+    let global_theme_name = theme_settings.theme.name(*system_appearance);
+    let project_theme_name = cx.global::<ActiveProjectTheme>().0.as_ref().cloned();
 
-    let theme = match themes.get(&theme_name.0) {
+    let theme = match project_theme_name.as_ref().map_or_else(
+        || themes.get(&global_theme_name.0),
+        |name| themes.get(&name.0),
+    ) {
         Ok(theme) => theme,
         Err(err) => {
             if themes.extensions_loaded() {
                 log::error!("{err}");
             }
-            themes
-                .get(default_theme(*system_appearance))
-                .unwrap_or_else(|_| themes.get(DEFAULT_DARK_THEME).unwrap())
+            project_theme_name
+                .and_then(|_| themes.get(&global_theme_name.0).ok())
+                .unwrap_or_else(|| {
+                    themes
+                        .get(default_theme(*system_appearance))
+                        .unwrap_or_else(|_| themes.get(DEFAULT_DARK_THEME).unwrap())
+                })
         }
     };
     theme_settings.apply_theme_overrides(theme)
+}
+
+/// Returns the currently configured global color theme name.
+pub fn global_theme_name(cx: &App) -> ThemeName {
+    ThemeSettings::get_global(cx)
+        .theme
+        .name(SystemAppearance::global(cx).0)
+}
+
+/// Applies a fixed color theme for the active project without changing user settings.
+///
+/// Returns whether the named theme currently exists. Missing themes retain their name
+/// in the override while rendering the configured global fallback.
+pub fn set_active_project_theme(theme_name: ThemeName, cx: &mut App) -> bool {
+    let exists = ThemeRegistry::default_global(cx).get(&theme_name.0).is_ok();
+    if cx.global::<ActiveProjectTheme>().0.as_ref() == Some(&theme_name) {
+        return exists;
+    }
+    cx.update_global::<ActiveProjectTheme, _>(|active, _| active.0 = Some(theme_name));
+    reload_theme(cx);
+    exists
+}
+
+/// Returns the fixed theme override currently applied for the active project.
+pub fn active_project_theme_name(cx: &App) -> Option<&ThemeName> {
+    cx.global::<ActiveProjectTheme>().0.as_ref()
+}
+
+/// Clears the active project override so the configured global theme is rendered.
+pub fn clear_active_project_theme(cx: &mut App) {
+    if cx.global::<ActiveProjectTheme>().0.is_none() {
+        return;
+    }
+    cx.update_global::<ActiveProjectTheme, _>(|active, _| active.0 = None);
+    reload_theme(cx);
 }
 
 fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {

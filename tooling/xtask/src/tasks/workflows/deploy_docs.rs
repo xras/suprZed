@@ -66,7 +66,7 @@ pub(crate) fn install_mdbook() -> Step<Use> {
         "actions-mdbook",
         "ee69d230fe19748b7abf22df32acaa93833fad08", // v2
     )
-    .with(("mdbook-version", "0.4.37"))
+    .with(("mdbook-version", "0.4.40"))
 }
 
 pub(crate) fn build_docs_book(docs_channel: String, site_url: String) -> Step<Run> {

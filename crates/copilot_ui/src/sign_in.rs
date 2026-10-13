@@ -739,6 +739,7 @@ impl Render for CopilotChatCodeVerification {
 pub struct ConfigurationView {
     copilot_status: Option<Status>,
     chat_status: Option<CopilotChatStatus>,
+    chat_account_name: Option<String>,
     is_authenticated: Box<dyn Fn(&mut App) -> bool + 'static>,
     edit_prediction: bool,
     /// When `true`, renders a compact control suitable for an inline settings
@@ -769,6 +770,7 @@ impl ConfigurationView {
                 Self {
                     copilot_status: copilot.as_ref().map(|copilot| copilot.0.read(cx).status()),
                     chat_status: None,
+                    chat_account_name: None,
                     is_authenticated: Box::new(is_authenticated),
                     edit_prediction,
                     _subscription: copilot.as_ref().map(|copilot| {
@@ -788,11 +790,16 @@ impl ConfigurationView {
                     chat_status: copilot_chat
                         .as_ref()
                         .map(|copilot_chat| copilot_chat.read(cx).status()),
+                    chat_account_name: copilot_chat.as_ref().and_then(|copilot_chat| {
+                        copilot_chat.read(cx).account_name().map(ToOwned::to_owned)
+                    }),
                     is_authenticated: Box::new(is_authenticated),
                     edit_prediction,
                     _subscription: copilot_chat.as_ref().map(|copilot_chat| {
                         cx.observe(copilot_chat, |this, model, cx| {
                             this.chat_status = Some(model.read(cx).status());
+                            this.chat_account_name =
+                                model.read(cx).account_name().map(ToOwned::to_owned);
                             cx.notify();
                         })
                     }),
@@ -1034,7 +1041,15 @@ impl Render for ConfigurationView {
         let edit_prediction = self.edit_prediction;
 
         if is_authenticated(cx) {
-            return ConfiguredApiCard::new("copilot-authorized", "Authorized")
+            let authorization_label: SharedString = if edit_prediction {
+                "Authorized".into()
+            } else if let Some(account_name) = &self.chat_account_name {
+                format!("Authorized as {account_name}").into()
+            } else {
+                "Authorized".into()
+            };
+
+            return ConfiguredApiCard::new("copilot-authorized", authorization_label)
                 .button_label("Sign Out")
                 .on_click(move |_, window, cx| {
                     if edit_prediction {

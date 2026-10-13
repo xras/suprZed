@@ -18,8 +18,8 @@ use chrono::DateTime;
 use fs::{FakeFs, Fs};
 use gpui::{App, Bounds, Hsla, Point, Rgba, TestAppContext, UpdateGlobal, VisualTestContext};
 use pretty_assertions::assert_eq;
-use project::AgentId;
-use settings::{Settings, SettingsStore};
+use project::{AgentId, Project};
+use settings::{NotifyWhenAgentWaiting, Settings, SettingsStore};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -67,6 +67,577 @@ fn init_test(cx: &mut TestAppContext) {
         language_model::LanguageModelRegistry::test(cx);
         prompt_store::init(cx);
     });
+}
+
+#[test]
+fn test_center_agent_kind_from_command() {
+    assert_eq!(
+        CenterAgentKind::from_command("codex"),
+        Some(CenterAgentKind::Codex)
+    );
+    assert_eq!(
+        CenterAgentKind::from_command(r"C:\Users\me\bin\CLAUDE.EXE"),
+        Some(CenterAgentKind::Claude)
+    );
+    assert_eq!(
+        CenterAgentKind::from_command("/usr/local/bin/copilot"),
+        Some(CenterAgentKind::Copilot)
+    );
+    assert_eq!(CenterAgentKind::from_command("pwsh.exe"), None);
+}
+
+#[test]
+fn test_center_agent_terminal_auto_name_uses_largest_matching_number() {
+    assert_eq!(
+        next_center_agent_terminal_title(CenterAgentKind::Codex, std::iter::empty()),
+        "codex-1"
+    );
+    assert_eq!(
+        next_center_agent_terminal_title(
+            CenterAgentKind::Codex,
+            [
+                "codex-1",
+                "CODEX-3",
+                "claude-12",
+                "codex",
+                "codex-0",
+                "codex-three",
+                "my-codex-20",
+            ],
+        ),
+        "codex-4"
+    );
+    assert_eq!(
+        next_center_agent_terminal_title(
+            CenterAgentKind::Copilot,
+            ["copilot-2", "codex-99", "copilot-1"],
+        ),
+        "copilot-3"
+    );
+}
+
+#[test]
+fn test_center_terminal_presentation_only_changes_on_derived_state_change() {
+    let initial = CenterTerminalPresentation {
+        project_worktree_root: None,
+        kind: CenterAgentKind::Codex,
+        title: "codex".into(),
+        custom_title: None,
+        working_directory: Some(PathBuf::from("project")),
+    };
+    let mut presentation = Some(initial.clone());
+
+    assert!(!update_center_terminal_presentation(
+        &mut presentation,
+        Some(initial.clone())
+    ));
+
+    let mut changed = initial;
+    changed.kind = CenterAgentKind::Claude;
+    assert!(update_center_terminal_presentation(
+        &mut presentation,
+        Some(changed)
+    ));
+    assert!(update_center_terminal_presentation(&mut presentation, None));
+    assert!(!update_center_terminal_presentation(
+        &mut presentation,
+        None
+    ));
+}
+
+#[test]
+fn test_center_terminal_worktree_match_uses_only_recorded_root() {
+    let root_a = PathBuf::from(util::path!("/worktree-a"));
+    let root_b = PathBuf::from(util::path!("/worktree-b"));
+    let roots = vec![
+        (root_a.clone(), root_a.clone(), ProjectGroupKey::default()),
+        (root_b.clone(), root_b.clone(), ProjectGroupKey::default()),
+    ];
+    assert_eq!(
+        matching_center_terminal_worktree(Some(&root_a), &roots)
+            .unwrap()
+            .1,
+        root_a
+    );
+    assert_eq!(
+        matching_center_terminal_worktree(Some(&root_b), &roots)
+            .unwrap()
+            .1,
+        root_b
+    );
+    assert!(matching_center_terminal_worktree(None, &roots).is_none());
+    assert!(matching_center_terminal_worktree(Some(&root_a.join("src")), &roots).is_none());
+    assert!(
+        matching_center_terminal_worktree(Some(Path::new(util::path!("/missing-root"))), &roots)
+            .is_none()
+    );
+}
+
+#[test]
+fn test_center_agent_terminal_notification_state() {
+    let mut has_notification = false;
+    assert!(mark_center_terminal_attention(
+        true,
+        &mut has_notification,
+        false
+    ));
+    assert!(has_notification);
+    assert!(!mark_center_terminal_attention(
+        true,
+        &mut has_notification,
+        false
+    ));
+    assert!(clear_center_terminal_attention(&mut has_notification));
+    assert!(!has_notification);
+    assert!(!clear_center_terminal_attention(&mut has_notification));
+
+    assert!(!mark_center_terminal_attention(
+        true,
+        &mut has_notification,
+        true
+    ));
+    assert!(!mark_center_terminal_attention(
+        false,
+        &mut has_notification,
+        false
+    ));
+}
+
+#[gpui::test]
+async fn test_center_terminal_notification_survives_window_activation(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        AgentSettings::override_global(
+            AgentSettings {
+                notify_when_agent_waiting: NotifyWhenAgentWaiting::PrimaryScreen,
+                ..AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let add_center_terminal = |cx: &mut VisualTestContext| {
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let terminal_view = cx.update(|window, cx| {
+            let terminal_view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal.clone(),
+                    workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            let pane = workspace.read(cx).active_pane().clone();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(
+                    Box::new(terminal_view.clone()),
+                    true,
+                    false,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+            terminal_view
+        });
+        cx.run_until_parked();
+        (terminal, terminal_view)
+    };
+    let (terminal, terminal_view) = add_center_terminal(cx);
+    let (_other_terminal, other_terminal_view) = add_center_terminal(cx);
+
+    let terminal_item_id = terminal_view.entity_id();
+    let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+    pane.read_with(cx, |pane, _| {
+        assert_eq!(
+            pane.active_item().map(|item| item.item_id()),
+            Some(other_terminal_view.entity_id()),
+        );
+    });
+    sidebar.update(cx, |sidebar, _| {
+        let record = sidebar
+            .center_terminal_records
+            .get_mut(&terminal_item_id)
+            .expect("centre terminal must be tracked by the Sidebar");
+        record.presentation = Some(CenterTerminalPresentation {
+            project_worktree_root: None,
+            kind: CenterAgentKind::Codex,
+            title: "codex".into(),
+            custom_title: None,
+            working_directory: None,
+        });
+    });
+
+    cx.deactivate_window();
+    terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(record.has_notification);
+        assert_eq!(record.notification_windows.len(), 1);
+        assert!(!record.notification_subscriptions.is_empty());
+    });
+
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(record.has_notification);
+        assert!(record.notification_windows.is_empty());
+        assert!(record.notification_subscriptions.is_empty());
+    });
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.activate_item(0, true, true, window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(!sidebar.center_terminal_records[&terminal_item_id].has_notification);
+    });
+
+    cx.deactivate_window();
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(!record.has_notification);
+        assert!(record.notification_windows.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_center_terminal_immediate_bell_with_threads_list_open(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        AgentSettings::override_global(
+            AgentSettings {
+                notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                ..AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let add_center_terminal = |cx: &mut VisualTestContext| {
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let terminal_view = cx.update(|window, cx| {
+            let terminal_view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal.clone(),
+                    workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            let pane = workspace.read(cx).active_pane().clone();
+            pane.update(cx, |pane, cx| {
+                pane.add_item(
+                    Box::new(terminal_view.clone()),
+                    true,
+                    false,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+            terminal_view
+        });
+        cx.run_until_parked();
+        (terminal, terminal_view)
+    };
+    let (terminal, terminal_view) = add_center_terminal(cx);
+    let (_other_terminal, other_terminal_view) = add_center_terminal(cx);
+
+    let terminal_item_id = terminal_view.entity_id();
+    let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+    pane.read_with(cx, |pane, _| {
+        assert_eq!(
+            pane.active_item().map(|item| item.item_id()),
+            Some(other_terminal_view.entity_id()),
+        );
+    });
+    sidebar.update(cx, |sidebar, _| {
+        let record = sidebar
+            .center_terminal_records
+            .get_mut(&terminal_item_id)
+            .expect("centre terminal must be tracked by the Sidebar");
+        record.presentation = Some(CenterTerminalPresentation {
+            project_worktree_root: None,
+            kind: CenterAgentKind::Codex,
+            title: "codex".into(),
+            custom_title: None,
+            working_directory: None,
+        });
+    });
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.sidebar_open());
+        assert!(multi_workspace.is_threads_list_view_active(cx));
+    });
+    cx.update(|window, _| {
+        window.activate_window();
+        assert!(window.is_window_active());
+    });
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.is_threads_list_view_active());
+        assert!(
+            sidebar
+                .center_terminal_subscriptions
+                .contains_key(&terminal_item_id)
+        );
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(!record.has_notification);
+        assert!(record.notification_windows.is_empty());
+    });
+
+    terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(record.has_notification);
+        assert!(record.notification_windows.is_empty());
+        assert!(record.notification_subscriptions.is_empty());
+        assert!(sidebar.is_threads_list_view_active());
+    });
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert!(multi_workspace.sidebar_open());
+    });
+    pane.read_with(cx, |pane, _| {
+        assert_eq!(
+            pane.active_item().map(|item| item.item_id()),
+            Some(other_terminal_view.entity_id())
+        );
+    });
+
+    pane.update_in(cx, |pane, window, cx| {
+        pane.activate_item(0, true, true, window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        let record = &sidebar.center_terminal_records[&terminal_item_id];
+        assert!(!record.has_notification);
+        assert!(record.notification_windows.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_center_terminal_provider_bells_clear_on_focus(cx: &mut TestAppContext) {
+    use workspace::Item as _;
+
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        AgentSettings::override_global(
+            AgentSettings {
+                notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                ..AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let add_terminal = |command: Option<&str>, cx: &mut VisualTestContext| {
+        let terminal = cx.new(|cx| {
+            let mut terminal = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx);
+            terminal.set_foreground_process_command_name_for_test(command.map(str::to_owned));
+            terminal
+        });
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| {
+                TerminalView::new(
+                    terminal.clone(),
+                    workspace.downgrade(),
+                    None,
+                    project.downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            workspace
+                .read(cx)
+                .active_pane()
+                .clone()
+                .update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view.clone()), true, false, None, window, cx);
+                });
+            view
+        });
+        cx.run_until_parked();
+        (terminal, view)
+    };
+    cx.update(|window, _| window.activate_window());
+    for command in ["codex", "claude", "copilot", "hermes"] {
+        let (first_terminal, first_view) = add_terminal(Some(command), cx);
+        let (second_terminal, second_view) = add_terminal(Some(command), cx);
+        let (background_terminal, background_view) = add_terminal(None, cx);
+        let first_id = first_view.entity_id();
+        let second_id = second_view.entity_id();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert_eq!(
+                sidebar.center_terminal_records[&first_id]
+                    .presentation
+                    .as_ref()
+                    .map(|p| p.kind),
+                CenterAgentKind::from_command(command),
+            );
+        });
+        first_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        second_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        cx.run_until_parked();
+        assert!(first_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        assert!(second_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.center_terminal_records[&first_id].has_notification);
+            assert!(sidebar.center_terminal_records[&second_id].has_notification);
+        });
+
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.activate_center_terminal(first_id, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!first_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        assert!(second_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&first_id].has_notification);
+            assert!(sidebar.center_terminal_records[&second_id].has_notification);
+        });
+        first_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        cx.run_until_parked();
+        assert!(!first_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&background_view, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        first_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        cx.run_until_parked();
+        assert!(first_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first_view, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!first_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&first_id].has_notification);
+            assert!(sidebar.center_terminal_records[&second_id].has_notification);
+        });
+        background_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        cx.run_until_parked();
+        let background_id = background_view.entity_id();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&background_id].has_notification);
+        });
+        background_terminal.update(cx, |terminal, cx| {
+            terminal.set_foreground_process_command_name_for_test(Some(command.to_owned()));
+            cx.emit(terminal::Event::TitleChanged);
+        });
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(sidebar.center_terminal_records[&background_id].has_notification);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&background_view, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(!background_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&background_id].has_notification);
+        });
+        background_terminal.update(cx, |terminal, cx| {
+            terminal.set_foreground_process_command_name_for_test(None);
+            cx.emit(terminal::Event::TitleChanged);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first_view, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        background_terminal.update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&background_view, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first_view, true, true, window, cx);
+        });
+        background_terminal.update(cx, |terminal, cx| {
+            terminal.set_foreground_process_command_name_for_test(Some(command.to_owned()));
+            cx.emit(terminal::Event::TitleChanged);
+        });
+        cx.run_until_parked();
+        assert!(!background_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&background_id].has_notification);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&second_view, true, false, window, cx);
+        });
+        focus_sidebar(&sidebar, cx);
+        cx.run_until_parked();
+        assert!(second_view.read_with(cx, |view, _| view.has_bell()));
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&second_id].has_notification);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&first_view, true, true, window, cx);
+        });
+        second_terminal.update(cx, |terminal, cx| {
+            terminal.set_working_directory_for_test(Some(PathBuf::from(util::path!(
+                "/my-project/changed-folder"
+            ))));
+            cx.emit(terminal::Event::TitleChanged);
+        });
+        cx.run_until_parked();
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.center_terminal_records[&second_id].has_notification);
+        });
+    }
 }
 
 #[track_caller]
@@ -1475,6 +2046,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
     let header = |path: &str| ListEntry::ProjectHeader {
         key: ProjectGroupKey::new(None, PathList::new(&[std::path::PathBuf::from(path)])),
         label: path.into(),
+        is_synthetic: false,
         highlight_positions: Vec::new(),
         has_running_threads: false,
         waiting_thread_count: 0,
@@ -1568,6 +2140,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::ProjectHeader {
                 key: ProjectGroupKey::new(None, expanded_path.clone()),
                 label: "expanded-project".into(),
+                is_synthetic: false,
                 highlight_positions: Vec::new(),
                 has_running_threads: false,
                 waiting_thread_count: 0,
@@ -1715,6 +2288,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             ListEntry::ProjectHeader {
                 key: ProjectGroupKey::new(None, collapsed_path.clone()),
                 label: "collapsed-project".into(),
+                is_synthetic: false,
                 highlight_positions: Vec::new(),
                 has_running_threads: false,
                 waiting_thread_count: 0,
@@ -15878,4 +16452,152 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
             .expect("solid background at pointer");
         u32::from(Rgba::from(color))
     })
+}
+
+#[cfg(windows)]
+#[gpui::test]
+async fn test_center_hermes_group_uses_creation_root_after_cwd_and_focus_changes(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let root_a = PathBuf::from(util::path!("/sidebar-owner-a"));
+    let root_b = PathBuf::from(util::path!("/sidebar-owner-b"));
+    let temporary_directory = PathBuf::from(util::path!("/hermes-temporary-host"));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(&root_a, serde_json::json!({ "file.rs": "" }))
+        .await;
+    fs.insert_tree(&root_b, serde_json::json!({ "file.rs": "" }))
+        .await;
+    let project = Project::test(fs, [root_a.as_path(), root_b.as_path()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let database_id = cx
+        .update(|_, cx| workspace::WorkspaceDb::global(cx))
+        .next_id()
+        .await
+        .unwrap();
+    workspace.update(cx, |workspace, _| {
+        workspace.set_database_id_for_test(database_id)
+    });
+    let (terminal, view) = cx.update(|window, cx| {
+        let terminal = cx.new(|cx| {
+            let builder = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .with_initial_working_directory(Some(root_a.clone()));
+            let mut terminal = builder.subscribe(cx);
+            terminal.set_foreground_process_command_name_for_test(Some("hermes".into()));
+            terminal.set_working_directory_for_test(Some(temporary_directory.clone()));
+            terminal
+        });
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                terminal.clone(),
+                workspace.downgrade(),
+                Some(database_id),
+                project.downgrade(),
+                window,
+                cx,
+            )
+        });
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_active_pane(Box::new(view.clone()), None, false, window, cx)
+        });
+        (terminal, view)
+    });
+    let resume_directory = root_a.join("exact-resume-folder");
+    let session = terminal_view::ResumableCliSession::new(
+        ResumableCliProvider::Hermes,
+        "20261004_000001_22beef".into(),
+        resume_directory.clone(),
+        terminal_view::ResumableCliEvidence::ProviderEvent,
+    )
+    .unwrap();
+    view.update(cx, |view, cx| view.set_resumable_cli_session(session, cx))
+        .await
+        .unwrap();
+    for working_directory in [&temporary_directory, &root_b, &root_a.join("src")] {
+        terminal.update(cx, |terminal, _| {
+            terminal.set_working_directory_for_test(Some(working_directory.clone()))
+        });
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle(cx), cx)
+        });
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| sidebar.rebuild_contents(cx));
+        sidebar.read_with(cx, |sidebar, cx| {
+            let entry = sidebar
+                .contents
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    ListEntry::Terminal(entry)
+                        if entry.center_view.as_ref().and_then(|view| view.upgrade())
+                            == Some(view.clone()) =>
+                    {
+                        Some(entry)
+                    }
+                    _ => None,
+                })
+                .expect("live centre Hermes entry");
+            assert_eq!(entry.metadata.folder_paths().paths(), &[root_a.clone()]);
+            assert_eq!(
+                entry.metadata.working_directory.as_ref(),
+                Some(working_directory)
+            );
+            assert_eq!(
+                sidebar
+                    .center_terminal_records
+                    .get(&view.entity_id())
+                    .unwrap()
+                    .presentation
+                    .as_ref()
+                    .unwrap()
+                    .project_worktree_root,
+                Some(root_a.clone())
+            );
+            assert_eq!(
+                view.read(cx)
+                    .resumable_cli_binding()
+                    .session()
+                    .unwrap()
+                    .resume_cwd(),
+                resume_directory.as_path()
+            );
+        });
+    }
+    let root_a_id = project.read_with(cx, |project, cx| {
+        project.find_project_path(&root_a, cx).unwrap().worktree_id
+    });
+    project.update(cx, |project, cx| project.remove_worktree(root_a_id, cx));
+    terminal.update(cx, |terminal, _| {
+        terminal.set_working_directory_for_test(Some(root_b.clone()))
+    });
+    sidebar.update(cx, |sidebar, cx| sidebar.rebuild_contents(cx));
+    sidebar.read_with(cx, |sidebar, _| {
+        let entry = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(entry)
+                    if entry.center_view.as_ref().and_then(|view| view.upgrade())
+                        == Some(view.clone()) =>
+                {
+                    Some(entry)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(entry.metadata.folder_paths().paths().is_empty());
+    });
 }

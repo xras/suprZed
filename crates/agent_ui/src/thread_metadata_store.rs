@@ -2428,6 +2428,7 @@ mod tests {
     async fn test_migrate_thread_remote_connections_backfills_from_workspace_db(
         cx: &mut TestAppContext,
     ) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
         init_test(cx);
 
         let folder_paths = PathList::new(&[Path::new("/remote-project")]);

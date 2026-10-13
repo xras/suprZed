@@ -565,6 +565,7 @@ impl Member {
 
                 let decoration = render_cx.decorate(pane, cx);
                 let is_active = pane == render_cx.active_pane();
+                let in_center_group = pane.read(cx).in_center_group;
 
                 let pane = div()
                     .relative()
@@ -580,6 +581,17 @@ impl Member {
                         AnyView::from(pane.clone())
                             .cached(StyleRefinement::default().v_flex().size_full()),
                     )
+                    .when(in_center_group, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h(px(1.))
+                                .bg(gpui::rgba(0x3aafa9b3)),
+                        )
+                    })
                     .when_some(decoration.border, |this, color| {
                         this.child(
                             div()
@@ -1543,10 +1555,12 @@ mod element {
                         window.set_cursor_style(cursor_style, &handle.hitbox);
                     }
 
-                    window.paint_quad(gpui::fill(
-                        handle.divider_bounds,
-                        cx.theme().colors().pane_group_border,
-                    ));
+                    let divider_color = if self.axis == Axis::Vertical {
+                        gpui::rgba(0x3aafa9b3).into()
+                    } else {
+                        cx.theme().colors().pane_group_border
+                    };
+                    window.paint_quad(gpui::fill(handle.divider_bounds, divider_color));
 
                     window.on_mouse_event({
                         let dragged_handle = layout.dragged_handle.clone();

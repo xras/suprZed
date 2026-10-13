@@ -48,7 +48,7 @@ use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
 use recent_projects::{RemoteSettings, open_remote_project};
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel, SuprZedVersion};
 use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
@@ -212,6 +212,11 @@ fn main() {
 
     let args = Args::parse();
 
+    #[cfg(target_os = "windows")]
+    if args.resumable_cli_hook {
+        process::exit(terminal_view::run_resumable_cli_hook_helper());
+    }
+
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
     if let Some(socket) = &args.askpass {
@@ -306,6 +311,21 @@ fn main() {
     let app_commit_sha =
         option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha::new(commit_sha.to_string()));
     let app_version = AppVersion::load(env!("CARGO_PKG_VERSION"), version, app_commit_sha.clone());
+    let suprzed_version = SuprZedVersion::new(
+        env!("SUPRZED_VERSION"),
+        env!("SUPRZED_ORIGIN"),
+        env!("SUPRZED_COMMIT"),
+        env!("SUPRZED_SOURCE_STATUS"),
+    )
+    .expect("invalid embedded suprZed metadata");
+
+    if args.version {
+        println!(
+            "{}",
+            suprzed_version.details(&app_version, *release_channel::RELEASE_CHANNEL)
+        );
+        return;
+    }
 
     if args.system_specs {
         let system_specs = system_specs::SystemSpecs::new_stateless(
@@ -314,7 +334,8 @@ fn main() {
             *release_channel::RELEASE_CHANNEL,
             client::telemetry::os_name(),
             client::telemetry::os_version(),
-        );
+        )
+        .with_suprzed_version(suprzed_version);
         println!("Zed System Specs (from CLI):\n{}", system_specs);
         return;
     }
@@ -334,6 +355,10 @@ fn main() {
             .map(|sha| sha.short())
             .as_deref()
             .unwrap_or("unknown"),
+    );
+    log::info!(
+        "{}",
+        suprzed_version.details(&app_version, *release_channel::RELEASE_CHANNEL)
     );
 
     #[cfg(windows)]
@@ -490,6 +515,7 @@ fn main() {
         zed_actions::init();
 
         release_channel::init(app_version, cx);
+        cx.set_global(suprzed_version);
         gpui_tokio::init(cx);
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);
@@ -1690,6 +1716,10 @@ fn stdout_is_a_pty() -> bool {
 #[derive(Parser, Debug)]
 #[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
 struct Args {
+    /// Print the fork version and upstream build information.
+    #[arg(short = 'v', long)]
+    version: bool,
+
     /// A sequence of space-separated paths or urls that you want to open.
     ///
     /// Use `path:line:row` syntax to open a file at a specific location.
@@ -1774,6 +1804,11 @@ struct Args {
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]
     printenv: bool,
+
+    /// Forward a Codex SessionStart hook to an authenticated Zed loopback listener.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    resumable_cli_hook: bool,
 
     /// Record an ETW trace. Must be run as administrator.
     #[cfg(target_os = "windows")]

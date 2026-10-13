@@ -1,7 +1,7 @@
 pub use gpui::GpuSpecs;
 use gpui::{App, AppContext as _, Task, Window, actions};
 use human_bytes::human_bytes;
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel, SuprZedVersion};
 use semver::Version;
 use serde::Serialize;
 use std::{env, fmt::Display};
@@ -26,6 +26,10 @@ pub struct SystemSpecs {
     commit_sha: Option<String>,
     bundle_type: Option<String>,
     gpu_specs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suprzed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suprzed_build: Option<String>,
 }
 
 impl SystemSpecs {
@@ -49,6 +53,7 @@ impl SystemSpecs {
             _ => None,
         };
         let bundle_type = bundle_type();
+        let fork = SuprZedVersion::try_global(cx);
 
         let gpu_specs = window.gpu_specs().map(|specs| {
             format!(
@@ -68,7 +73,10 @@ impl SystemSpecs {
                 architecture,
                 commit_sha,
                 gpu_specs,
+                suprzed_version: None,
+                suprzed_build: None,
             }
+            .with_optional_suprzed_version(fork)
         })
     }
 
@@ -100,7 +108,22 @@ impl SystemSpecs {
             commit_sha,
             bundle_type,
             gpu_specs: try_determine_available_gpus(),
+            suprzed_version: None,
+            suprzed_build: None,
         }
+    }
+
+    fn with_optional_suprzed_version(self, fork: Option<SuprZedVersion>) -> Self {
+        match fork {
+            Some(fork) => self.with_suprzed_version(fork),
+            None => self,
+        }
+    }
+
+    pub fn with_suprzed_version(mut self, fork: SuprZedVersion) -> Self {
+        self.suprzed_version = Some(fork.version().to_string());
+        self.suprzed_build = Some(format!("{} {}", fork.build_summary(), fork.commit()));
+        self
     }
 }
 
@@ -125,6 +148,14 @@ impl Display for SystemSpecs {
                 ""
             },
         );
+        if let Some(version) = &self.suprzed_version {
+            writeln!(f, "suprZed: v{version}")?;
+            writeln!(
+                f,
+                "Build: {}",
+                self.suprzed_build.as_deref().unwrap_or("unknown")
+            )?;
+        }
         let system_specs = [
             app_version_information,
             os_information,
@@ -294,4 +325,44 @@ fn bundle_type() -> Option<String> {
     option_env!("ZED_BUNDLE_TYPE")
         .map(|bundle_type| bundle_type.to_string())
         .or_else(|| env::var("ZED_BUNDLE_TYPE").ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> SystemSpecs {
+        SystemSpecs {
+            app_version: "1.25.0+dev.abcdef".into(),
+            release_channel: "Zed Dev",
+            os_name: "Test OS".into(),
+            os_version: "1".into(),
+            memory: 1024,
+            architecture: "x86_64",
+            commit_sha: None,
+            bundle_type: None,
+            gpu_specs: None,
+            suprzed_version: None,
+            suprzed_build: None,
+        }
+    }
+
+    #[test]
+    fn fork_diagnostics_keep_upstream_fields() {
+        let fork = SuprZedVersion::new("0.1.1935", "managed", "unknown", "unknown").unwrap();
+        let specs = fixture().with_suprzed_version(fork);
+        let text = specs.to_string();
+        assert!(text.starts_with("suprZed: v0.1.1935\nBuild: managed (unknown) unknown\nZed: v1.25.0+dev.abcdef (Zed Dev)"));
+        assert_eq!(specs.app_version, "1.25.0+dev.abcdef");
+        assert_eq!(specs.release_channel, "Zed Dev");
+        assert_eq!(specs.suprzed_version.as_deref(), Some("0.1.1935"));
+    }
+
+    #[test]
+    fn other_app_users_have_no_fork_diagnostics() {
+        let specs = fixture();
+        assert!(specs.to_string().starts_with("Zed: v1.25.0+dev.abcdef"));
+        assert_eq!(specs.suprzed_version, None);
+        assert_eq!(specs.suprzed_build, None);
+    }
 }

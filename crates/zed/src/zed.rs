@@ -68,7 +68,7 @@ use project::{
 use project_panel::ProjectPanel;
 use quick_action_bar::QuickActionBar;
 use recent_projects::open_remote_project;
-use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel, SuprZedVersion};
 use rope::Rope;
 use search::project_search::ProjectSearchBar;
 use settings::{
@@ -1549,6 +1549,7 @@ fn open_about_window(cx: &mut App) {
         message: SharedString,
         commit: Option<SharedString>,
         full_version: SharedString,
+        fork_details: Option<SharedString>,
     }
 
     impl AboutWindow {
@@ -1563,11 +1564,13 @@ fn open_about_window(cx: &mut App) {
             } else {
                 ""
             };
+            let fork = SuprZedVersion::try_global(cx);
             let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
                 .map(SharedString::from);
+            let fork_details = fork.map(|fork| fork.about_details().into());
 
             Self {
                 focus_handle: cx.focus_handle(),
@@ -1577,6 +1580,7 @@ fn open_about_window(cx: &mut App) {
                 message,
                 commit,
                 full_version,
+                fork_details,
             }
         }
 
@@ -1590,6 +1594,10 @@ fn open_about_window(cx: &mut App) {
                 }
                 None => format!("{}\nVersion: {}", self.message, self.full_version),
             };
+            let content = self.fork_details.as_ref().map_or_else(
+                || content.clone(),
+                |details| format!("{details}\n{content}"),
+            );
             cx.write_to_clipboard(ClipboardItem::new_string(content));
             window.remove_window();
         }
@@ -1622,7 +1630,32 @@ fn open_about_window(cx: &mut App) {
                             .gap_2()
                             .items_center()
                             .child(img(self.app_icon.clone()).size_16().flex_none())
-                            .child(Headline::new(self.message.clone()))
+                            .when_some(self.fork_details.clone(), |this, details| {
+                                this.children(
+                                    details.lines().enumerate().map(|(index, line)| {
+                                        if index == 0 {
+                                            v_flex()
+                                                .w_full()
+                                                .gap_2()
+                                                .child(
+                                                    Headline::new(line.to_owned())
+                                                        .size(HeadlineSize::XLarge),
+                                                )
+                                                .child(
+                                                    Label::new("suprZed is a customised version of the wonderful Zed editor")
+                                                        .size(LabelSize::Small)
+                                                        .line_clamp(2),
+                                                )
+                                                .into_any_element()
+                                        } else {
+                                            Label::new(line.to_owned())
+                                                .size(LabelSize::Small)
+                                                .into_any_element()
+                                        }
+                                    }),
+                                )
+                            })
+                            .child(Label::new(self.message.clone()).size(LabelSize::Small))
                             .when_some(self.commit.clone(), |this, commit| {
                                 this.child(
                                     Label::new("Commit")
@@ -1636,7 +1669,7 @@ fn open_about_window(cx: &mut App) {
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.full_version.clone()).size(LabelSize::XSmall)),
                     )
                     .child(
                         h_flex()
@@ -1711,13 +1744,13 @@ fn open_about_window(cx: &mut App) {
 
     let window_size = Size {
         width: px(440.),
-        height: px(300.),
+        height: px(440.),
     };
 
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some("About suprZed".into()),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

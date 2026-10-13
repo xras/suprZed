@@ -132,6 +132,7 @@ impl Project {
             .map(|p| self.active_toolchain(p, LanguageName::new_static("Python"), cx))
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
+        let initial_working_directory = path.as_ref().map(|path| path.to_path_buf());
         cx.spawn(async move |project, cx| {
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
@@ -256,6 +257,7 @@ impl Project {
                     ))
                 })??
                 .await?;
+            let builder = builder.with_initial_working_directory(initial_working_directory);
             project.update(cx, move |this, cx| {
                 let terminal_handle = cx.new(|cx| builder.subscribe(cx));
 
@@ -287,7 +289,16 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, HashMap::default(), cx)
+    }
+
+    pub fn create_terminal_shell_with_env(
+        &mut self,
+        cwd: Option<PathBuf>,
+        env: HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, env, cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -304,7 +315,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, HashMap::default(), cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -314,6 +325,7 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        terminal_env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -383,6 +395,7 @@ impl Project {
             self.resolve_directory_environment(&env_shell, path.clone(), remote_client.clone(), cx);
 
         let lang_registry = self.languages.clone();
+        let initial_working_directory = path.as_ref().map(|path| path.to_path_buf());
         cx.spawn(async move |project, cx| {
             let remote_shell = if let Some(remote_shell_request) = remote_shell_request {
                 let response = remote_shell_request
@@ -404,6 +417,7 @@ impl Project {
             let shell_kind = ShellKind::new(&shell_program, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            env.extend(terminal_env);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -460,6 +474,7 @@ impl Project {
                     ))
                 })??
                 .await?;
+            let builder = builder.with_initial_working_directory(initial_working_directory);
             project.update(cx, move |this, cx| {
                 let terminal_handle = cx.new(|cx| builder.subscribe(cx));
 

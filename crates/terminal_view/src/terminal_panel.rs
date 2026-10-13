@@ -1,5 +1,6 @@
 use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 
+use crate::persistence::PersistentTerminalId;
 use crate::{
     TerminalView, default_working_directory,
     persistence::{
@@ -160,6 +161,24 @@ impl TerminalPanel {
                                             "New Terminal",
                                             workspace::NewTerminal::default().boxed_clone(),
                                         )
+                                        .when(cfg!(target_os = "windows"), |menu| {
+                                            menu.action(
+                                                "New Resumable Codex Terminal",
+                                                crate::NewResumableCodexTerminal.boxed_clone(),
+                                            )
+                                            .action(
+                                                "New Resumable Claude Terminal",
+                                                crate::NewResumableClaudeTerminal.boxed_clone(),
+                                            )
+                                            .action(
+                                                "New Resumable Copilot Terminal",
+                                                crate::NewResumableCopilotTerminal.boxed_clone(),
+                                            )
+                                            .action(
+                                                "New Resumable Hermes Terminal",
+                                                crate::NewResumableHermesTerminal.boxed_clone(),
+                                            )
+                                        })
                                         // We want the focus to go back to terminal panel once task modal is dismissed,
                                         // hence we focus that first. Otherwise, we'd end up without a focused element, as
                                         // context menu will be gone the moment we spawn the modal.
@@ -224,6 +243,22 @@ impl TerminalPanel {
                 (None, right_children)
             });
         });
+    }
+
+    pub(crate) fn saved_persistent_terminal_ids(
+        workspace_id: workspace::WorkspaceId,
+        cx: &App,
+    ) -> Result<Vec<PersistentTerminalId>> {
+        let key = format!(
+            "{:?}-{:?}",
+            TERMINAL_PANEL_KEY,
+            i64::from(workspace_id).to_string()
+        );
+        let Some(saved) = KeyValueStore::global(cx).read_kvp(&key)? else {
+            return Ok(Vec::new());
+        };
+        let panel: SerializedTerminalPanel = serde_json::from_str(&saved)?;
+        panel.persistent_terminal_ids(workspace_id)
     }
 
     fn serialization_key(workspace: &Workspace) -> Option<String> {
@@ -740,13 +775,10 @@ impl TerminalPanel {
         cx: &mut Context<Workspace>,
     ) {
         let center_pane = workspace.active_pane();
-        let center_pane_has_focus = center_pane.focus_handle(cx).contains_focused(window, cx);
-        let active_center_item_is_terminal = center_pane
-            .read(cx)
-            .active_item()
-            .is_some_and(|item| item.downcast::<TerminalView>().is_some());
+        let center_pane_has_focus = center_pane.read(cx).has_focus(window, cx)
+            || center_pane.update(cx, |pane, cx| pane.context_menu_focused(window, cx));
 
-        if center_pane_has_focus && active_center_item_is_terminal {
+        if center_pane_has_focus {
             let working_directory = default_working_directory(workspace, cx);
             let local = action.local;
             Self::add_center_terminal(workspace, window, cx, move |project, cx| {
@@ -861,6 +893,7 @@ impl TerminalPanel {
                         window,
                         cx,
                     )
+                    .with_persistent_terminal_id(PersistentTerminalId::new())
                 });
                 // Don't steal focus from an open modal (e.g. the command palette):
                 // a background terminal can finish starting up after the user has
@@ -875,6 +908,51 @@ impl TerminalPanel {
                 );
             })?;
             Ok(terminal.downgrade())
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn add_center_terminal_with_env(
+        workspace: &mut Workspace,
+        working_directory: PathBuf,
+        environment: HashMap<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<Result<Entity<TerminalView>>> {
+        if !is_enabled_in_workspace(workspace, cx) {
+            return Task::ready(Err(anyhow!(
+                "resumable CLI terminals require a local workspace"
+            )));
+        }
+        let project = workspace.project().downgrade();
+        cx.spawn_in(window, async move |workspace, cx| {
+            let terminal = project
+                .update(cx, |project, cx| {
+                    project.create_terminal_shell_with_env(Some(working_directory), environment, cx)
+                })?
+                .await?;
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let terminal_view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace.weak_handle(),
+                        workspace.database_id(),
+                        workspace.project().downgrade(),
+                        window,
+                        cx,
+                    )
+                    .with_persistent_terminal_id(PersistentTerminalId::new())
+                });
+                workspace.add_item_to_active_pane(
+                    Box::new(terminal_view.clone()),
+                    None,
+                    !workspace.has_active_modal(window, cx),
+                    window,
+                    cx,
+                );
+                terminal_view
+            })
         })
     }
 
@@ -1067,15 +1145,32 @@ impl TerminalPanel {
                 .timer(Duration::from_millis(50))
                 .await;
             let terminal_panel = terminal_panel.upgrade()?;
-            let items = terminal_panel.update(cx, |terminal_panel, cx| {
-                SerializedItems::WithSplits(serialize_pane_group(
+            let (items, snapshot_tasks) = terminal_panel.update(cx, |terminal_panel, cx| {
+                let views = terminal_panel
+                    .center
+                    .panes()
+                    .iter()
+                    .flat_map(|pane| pane.read(cx).items_of_type::<TerminalView>())
+                    .collect::<Vec<_>>();
+                let snapshot_tasks = views
+                    .into_iter()
+                    .filter_map(|view| {
+                        let item_id = view.entity_id().as_u64();
+                        view.update(cx, |view, cx| view.persist_snapshot(item_id, cx))
+                    })
+                    .collect::<Vec<_>>();
+                let items = SerializedItems::WithSplits(serialize_pane_group(
                     &terminal_panel.center,
                     &terminal_panel.active_pane,
                     cx,
-                ))
+                ));
+                (items, snapshot_tasks)
             });
             cx.background_spawn(
                 async move {
+                    for snapshot in snapshot_tasks {
+                        snapshot.await?;
+                    }
                     kvp.write_kvp(
                         serialization_key,
                         serde_json::to_string(&SerializedTerminalPanel {
@@ -1317,7 +1412,11 @@ pub fn new_terminal_pane(
             workspace.clone(),
             project.clone(),
             Default::default(),
-            None,
+            Some(Arc::new(|dragged_item, _, _| {
+                dragged_item
+                    .downcast_ref::<DraggedTab>()
+                    .is_some_and(|tab| tab.item.downcast::<TerminalView>().is_some())
+            })),
             workspace::NewTerminal::default().boxed_clone(),
             false,
             window,
@@ -1877,12 +1976,47 @@ mod tests {
     use std::num::NonZero;
 
     use super::*;
-    use crate::persistence::{SerializedPane, SerializedPaneGroup};
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use crate::persistence::{
+        PersistentTerminalId, SerializedPane, SerializedPaneGroup, TerminalDb,
+    };
+    use crate::{
+        ResumableCliBinding, ResumableCliEvidence, ResumableCliProvider, ResumableCliSession,
+    };
+    use db::AppDatabase;
+    use gpui::{
+        EventEmitter, Focusable, Modifiers, Render, TestAppContext, UpdateGlobal as _,
+        VisualTestContext,
+    };
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
-    use workspace::{MultiWorkspace, WorkspaceId};
+    use workspace::{Item, MultiWorkspace, PersistentItemId, WorkspaceDb, WorkspaceId};
+
+    struct CenterTestItem {
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<()> for CenterTestItem {}
+
+    impl Focusable for CenterTestItem {
+        fn focus_handle(&self, _cx: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for CenterTestItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl Item for CenterTestItem {
+        type Event = ();
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Center Test Item".into()
+        }
+    }
 
     #[test]
     fn test_prepare_empty_task() {
@@ -2409,6 +2543,7 @@ mod tests {
                     SerializedTerminalPanel {
                         items: SerializedItems::WithSplits(SerializedPaneGroup::Pane(
                             SerializedPane {
+                                persistent_item_ids: HashMap::default(),
                                 active: true,
                                 children: vec![12345],
                                 active_item: Some(12345),
@@ -2906,6 +3041,208 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_two_center_terminals_keep_persistent_identity_across_restores(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+
+        let workspace_db = cx.update(|cx| WorkspaceDb::global(cx));
+        let workspace_id = workspace_db.next_id().await.unwrap();
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        window_handle
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace.workspace().update(cx, |workspace, _| {
+                    workspace.set_database_id_for_test(workspace_id)
+                });
+            })
+            .unwrap();
+
+        let sessions = [
+            "0199a4f5-1fe0-7000-8000-000000000001",
+            "0199a4f5-1fe0-7000-8000-000000000002",
+        ];
+        for (index, exact_resume_id) in sessions.into_iter().enumerate() {
+            window_handle
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
+                            project.create_terminal_shell(None, cx)
+                        })
+                    })
+                })
+                .unwrap()
+                .await
+                .unwrap();
+
+            let terminal_view = window_handle
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .active_pane()
+                        .read(cx)
+                        .active_item()
+                        .unwrap()
+                        .downcast::<TerminalView>()
+                        .unwrap()
+                })
+                .unwrap();
+            terminal_view.update(cx, |terminal_view, cx| {
+                terminal_view.set_custom_title(Some(format!("codex-{}", index + 1)), cx);
+            });
+            terminal_view
+                .update(cx, |terminal_view, cx| {
+                    terminal_view.set_resumable_cli_session(
+                        ResumableCliSession::new(
+                            ResumableCliProvider::Codex,
+                            exact_resume_id.to_owned(),
+                            if cfg!(windows) {
+                                PathBuf::from(r"C:\project-a")
+                            } else {
+                                PathBuf::from("/project-a")
+                            },
+                            ResumableCliEvidence::ProviderEvent,
+                        )
+                        .unwrap(),
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+        }
+
+        let flush = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .unwrap();
+        flush.await;
+
+        let terminal_state = |multi_workspace: &MultiWorkspace, cx: &App| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_pane()
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .map(|terminal_view| {
+                    let terminal_view_ref = terminal_view.read(cx);
+                    (
+                        terminal_view.entity_id().as_u64(),
+                        terminal_view_ref
+                            .persistent_terminal_id
+                            .as_ref()
+                            .unwrap()
+                            .as_str()
+                            .to_owned(),
+                        terminal_view_ref.custom_title.clone().unwrap(),
+                        terminal_view_ref
+                            .resumable_cli_binding
+                            .session()
+                            .unwrap()
+                            .exact_resume_id()
+                            .to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let initial = window_handle.read_with(cx, terminal_state).unwrap();
+        assert_eq!(initial.len(), 2);
+
+        for _ in 0..2 {
+            window_handle
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |_, cx| {
+                        Workspace::restore_database_layout_for_test(workspace_id, window, cx)
+                    })
+                })
+                .unwrap()
+                .await
+                .unwrap();
+            let flush = window_handle
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.flush_serialization(window, cx)
+                    })
+                })
+                .unwrap();
+            flush.await;
+        }
+
+        let restored = window_handle.read_with(cx, terminal_state).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored
+                .iter()
+                .map(|(_, id, title, resume_id)| (id, title, resume_id))
+                .collect::<Vec<_>>(),
+            initial
+                .iter()
+                .map(|(_, id, title, resume_id)| (id, title, resume_id))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            restored
+                .iter()
+                .zip(&initial)
+                .all(|(restored, initial)| restored.0 != initial.0)
+        );
+
+        let persistent_ids = restored
+            .iter()
+            .map(|(_, id, _, _)| id.clone())
+            .collect::<Vec<_>>();
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let pane = multi_workspace.workspace().read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    let item_ids = pane.items().map(|item| item.item_id()).collect::<Vec<_>>();
+                    for item_id in item_ids {
+                        pane.remove_item(item_id, false, false, window, cx);
+                    }
+                    let placeholder = cx.new(|cx| CenterTestItem {
+                        focus_handle: cx.focus_handle(),
+                    });
+                    pane.add_item(Box::new(placeholder), false, false, None, window, cx);
+                });
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .unwrap()
+            .await;
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |_, cx| {
+                    Workspace::restore_database_layout_for_test(workspace_id, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let terminal_db = cx.update(|cx| TerminalDb::global(cx));
+        for persistent_id in persistent_ids {
+            let persistent_id =
+                PersistentTerminalId::from_layout(PersistentItemId::new(persistent_id)).unwrap();
+            assert!(
+                terminal_db
+                    .get_persistent_center_snapshot(&persistent_id, workspace_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_terminal_panel_starts_open_follows_setting(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
@@ -2939,65 +3276,6 @@ mod tests {
                 });
             })
             .expect("Failed to read configured terminal panel starts_open");
-    }
-
-    #[gpui::test]
-    async fn test_new_terminal_opens_in_panel_by_default(cx: &mut TestAppContext) {
-        cx.executor().allow_parking();
-        init_test(cx);
-
-        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
-
-        let panel_items_before =
-            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
-        let center_items_before = window_handle
-            .read_with(cx, |multi_workspace, cx| {
-                multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .active_pane()
-                    .read(cx)
-                    .items_len()
-            })
-            .expect("Failed to read center pane items");
-
-        window_handle
-            .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.workspace().update(cx, |workspace, cx| {
-                    TerminalPanel::new_terminal(
-                        workspace,
-                        &workspace::NewTerminal::default(),
-                        window,
-                        cx,
-                    );
-                })
-            })
-            .expect("Failed to dispatch new_terminal");
-
-        cx.run_until_parked();
-
-        let panel_items_after =
-            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
-        let center_items_after = window_handle
-            .read_with(cx, |multi_workspace, cx| {
-                multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .active_pane()
-                    .read(cx)
-                    .items_len()
-            })
-            .expect("Failed to read center pane items");
-
-        assert_eq!(
-            panel_items_after,
-            panel_items_before + 1,
-            "Terminal should be added to the panel when no center terminal is focused"
-        );
-        assert_eq!(
-            center_items_after, center_items_before,
-            "Center pane should not gain a new terminal"
-        );
     }
 
     #[gpui::test]
@@ -3090,6 +3368,818 @@ mod tests {
             panel_items_after, panel_items_before,
             "Terminal panel should not gain a new terminal"
         );
+    }
+
+    #[gpui::test]
+    async fn test_new_terminal_opens_in_center_when_non_terminal_center_item_focused(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let item = cx.new(|cx| CenterTestItem {
+                        focus_handle: cx.focus_handle(),
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(item.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    window.focus(&item.read(cx).focus_handle(cx), cx);
+                })
+            })
+            .expect("Failed to focus non-terminal center item");
+        cx.run_until_parked();
+
+        let center_items_before = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len()
+            })
+            .expect("Failed to read center pane items");
+        let panel_items_before =
+            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::new_terminal(
+                        workspace,
+                        &workspace::NewTerminal::default(),
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .expect("Failed to dispatch new_terminal");
+        cx.run_until_parked();
+
+        let center_items_after = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len()
+            })
+            .expect("Failed to read center pane items");
+        let panel_items_after =
+            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
+
+        assert_eq!(center_items_after, center_items_before + 1);
+        assert_eq!(panel_items_after, panel_items_before);
+    }
+
+    #[gpui::test]
+    async fn test_explicit_center_terminal_matches_focused_new_terminal_host(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let center_item = window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let item = cx.new(|cx| CenterTestItem {
+                        focus_handle: cx.focus_handle(),
+                    });
+                    workspace.add_item_to_active_pane(
+                        Box::new(item.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                    window.focus(&item.read(cx).focus_handle(cx), cx);
+                    item
+                })
+            })
+            .expect("Failed to focus center item");
+        cx.run_until_parked();
+
+        let panel_items_before =
+            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalPanel::new_terminal(
+                        workspace,
+                        &workspace::NewTerminal::default(),
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .expect("Failed to create focused center terminal");
+        cx.run_until_parked();
+
+        let focused_terminal = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<TerminalView>())
+            })
+            .expect("Failed to read center pane")
+            .expect("New Terminal should create a center TerminalView");
+
+        window_handle
+            .update(cx, |_, window, cx| {
+                window.focus(&terminal_panel.read(cx).focus_handle(cx), cx);
+            })
+            .expect("Failed to focus terminal panel");
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    TerminalView::deploy(
+                        workspace,
+                        &workspace::NewCenterTerminal::default(),
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .expect("Failed to create explicit center terminal");
+        cx.run_until_parked();
+
+        window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                let pane = multi_workspace.workspace().read(cx).active_pane().clone();
+                let items = pane
+                    .read(cx)
+                    .items()
+                    .map(|item| (item.item_id(), item.downcast::<TerminalView>().is_some()))
+                    .collect::<Vec<_>>();
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], (center_item.entity_id(), false));
+                assert_eq!(items[1], (focused_terminal.entity_id(), true));
+                assert!(items[2].1);
+                assert_ne!(items[1].0, items[2].0);
+            })
+            .expect("Failed to inspect center terminals");
+        let panel_items_after =
+            terminal_panel.read_with(cx, |panel, cx| panel.active_pane.read(cx).items_len());
+        assert_eq!(panel_items_after, panel_items_before);
+    }
+
+    #[gpui::test]
+    async fn test_legacy_dock_terminal_restores_in_center_with_exact_binding(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        let workspace_id = cx
+            .update(|cx| WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let (window_handle, panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.set_database_id_for_test(workspace_id)
+        });
+        let working_directory = std::env::current_dir().unwrap();
+        let session = ResumableCliSession::new(
+            ResumableCliProvider::Codex,
+            "0199a4f5-1fe0-7000-8000-000000000022".into(),
+            working_directory.clone(),
+            ResumableCliEvidence::ProviderEvent,
+        )
+        .unwrap();
+        let database = cx.update(|cx| crate::persistence::TerminalDb::global(cx));
+        database
+            .save_snapshot(
+                42421,
+                workspace_id,
+                Some(working_directory.clone()),
+                Some("legacy dock agent".into()),
+            )
+            .await
+            .unwrap();
+        database
+            .compare_and_set_resumable_cli_session(42421, workspace_id, 0, Some(session.clone()))
+            .await
+            .unwrap();
+        let saved = SerializedTerminalPanel {
+            items: SerializedItems::NoSplits(vec![42421]),
+            active_item_id: Some(42421),
+        };
+        let restored_count = window_handle
+            .update(cx, |_, window, cx| {
+                deserialize_terminal_panel(
+                    workspace.downgrade(),
+                    workspace.read(cx).project().clone(),
+                    workspace_id,
+                    saved,
+                    panel.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(restored_count, 1);
+        let dock_pane = panel.read_with(cx, |panel, _| panel.active_pane.clone());
+        let terminal_view = dock_pane.read_with(cx, |pane, _| {
+            pane.active_item()
+                .unwrap()
+                .downcast::<TerminalView>()
+                .unwrap()
+        });
+        let identity = PersistentTerminalId::legacy(workspace_id, 42421);
+        let assert_state = |view: &TerminalView, cx: &App| {
+            assert_eq!(view.persistent_terminal_id.as_ref(), Some(&identity));
+            assert_eq!(view.custom_title(), Some("legacy dock agent"));
+            assert_eq!(
+                view.terminal().read(cx).initial_working_directory(),
+                Some(working_directory.as_path())
+            );
+            assert_eq!(view.resumable_cli_binding.revision(), 1);
+            assert_eq!(view.resumable_cli_binding.session(), Some(&session));
+        };
+        terminal_view.read_with(cx, assert_state);
+        let center_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace::move_item(
+                    &dock_pane,
+                    &center_pane,
+                    terminal_view.entity_id(),
+                    0,
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .unwrap()
+            .await;
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |_, cx| {
+                    Workspace::restore_database_layout_for_test(workspace_id, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let restored = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_pane()
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<TerminalView>())
+                .find(|view| view.read(cx).persistent_terminal_id.as_ref() == Some(&identity))
+                .unwrap()
+        });
+        assert_ne!(restored.entity_id(), terminal_view.entity_id());
+        restored.read_with(cx, assert_state);
+    }
+
+    #[gpui::test]
+    async fn test_terminal_host_round_trip_and_drop_admission(cx: &mut TestAppContext) {
+        check_terminal_host_round_trip(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn pending_codex_restores_across_center_and_dock(cx: &mut TestAppContext) {
+        check_terminal_host_round_trip(cx, true).await;
+    }
+
+    async fn check_terminal_host_round_trip(cx: &mut TestAppContext, pending: bool) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        let workspace_id = cx
+            .update(|cx| WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _| {
+            workspace.set_database_id_for_test(workspace_id)
+        });
+        let cwd = std::env::current_dir().unwrap();
+        let live_cwd = std::env::temp_dir();
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.as_fake().insert_tree(&cwd, serde_json::json!({})).await;
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(&cwd, true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.set_database_id_for_test(workspace_id)
+        });
+        let launch_cwd = cwd.clone();
+        window_handle
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
+                        project.create_terminal_shell(Some(launch_cwd), cx)
+                    })
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let mut center_pane =
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let terminal_view = center_pane.read_with(cx, |pane, _| {
+            pane.active_item()
+                .unwrap()
+                .downcast::<TerminalView>()
+                .unwrap()
+        });
+        assert_eq!(
+            terminal_view.read_with(cx, |view, _| view.workspace_id),
+            Some(workspace_id)
+        );
+        terminal_view
+            .read_with(cx, |view, _| view.terminal().clone())
+            .update(cx, |terminal, _| {
+                terminal.set_working_directory_for_test(Some(live_cwd.clone()))
+            });
+        terminal_view.update(cx, |view, cx| {
+            view.set_custom_title(Some("host round trip".into()), cx)
+        });
+        let session = ResumableCliSession::new(
+            ResumableCliProvider::Codex,
+            "0199a4f5-1fe0-7000-8000-000000000021".into(),
+            cwd.clone(),
+            ResumableCliEvidence::ProviderEvent,
+        )
+        .unwrap();
+        terminal_view
+            .update(cx, |view, cx| {
+                if pending {
+                    view.replace_resumable_cli_association(None, Some(cwd.clone()), cx)
+                } else {
+                    view.set_resumable_cli_session(session.clone(), cx)
+                }
+            })
+            .await
+            .unwrap();
+        let persistent_id =
+            terminal_view.read_with(cx, |view, _| view.persistent_terminal_id.clone().unwrap());
+        let mut dock_pane = terminal_panel.read_with(cx, |panel, _| panel.active_pane.clone());
+        let unsupported = window_handle
+            .update(cx, |_, window, cx| {
+                let item = cx.new(|cx| CenterTestItem {
+                    focus_handle: cx.focus_handle(),
+                });
+                center_pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(item.clone()), false, false, None, window, cx)
+                });
+                item
+            })
+            .unwrap();
+        for (item, accepted) in [
+            (
+                Box::new(unsupported.clone()) as Box<dyn workspace::ItemHandle>,
+                false,
+            ),
+            (Box::new(terminal_view.clone()), true),
+        ] {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    let index = center_pane
+                        .read(cx)
+                        .items()
+                        .position(|candidate| candidate.item_id() == item.item_id())
+                        .unwrap();
+                    let dragged = DraggedTab {
+                        pane: center_pane.clone(),
+                        item: item.clone(),
+                        ix: index,
+                        detail: 0,
+                        is_active: true,
+                    };
+                    dock_pane.update(cx, |pane, cx| {
+                        pane.handle_tab_drop(&dragged, 0, false, window, cx)
+                    });
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                dock_pane.read_with(cx, |pane, _| pane
+                    .items()
+                    .position(|candidate| candidate.item_id() == item.item_id())
+                    .is_some()),
+                accepted
+            );
+            assert_eq!(
+                center_pane.read_with(cx, |pane, _| pane
+                    .items()
+                    .position(|candidate| candidate.item_id() == item.item_id())
+                    .is_some()),
+                !accepted
+            );
+        }
+        for _ in 0..2 {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.flush_serialization(window, cx)
+                    })
+                })
+                .unwrap()
+                .await;
+            terminal_panel.update(cx, |panel, cx| panel.serialize(cx));
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+            terminal_panel
+                .update(cx, |panel, _| {
+                    std::mem::replace(&mut panel.pending_serialization, Task::ready(None))
+                })
+                .await;
+            let serialized_key = workspace.read_with(cx, |workspace, _| {
+                TerminalPanel::serialization_key(workspace).unwrap()
+            });
+            let saved = cx
+                .update(|cx| KeyValueStore::global(cx))
+                .read_kvp(&serialized_key)
+                .unwrap()
+                .unwrap();
+            let saved: SerializedTerminalPanel = serde_json::from_str(&saved).unwrap();
+            assert_eq!(
+                workspace.read_with(cx, |workspace, _| workspace.database_id()),
+                Some(workspace_id),
+                "workspace ID changed before dock cleanup"
+            );
+            assert!(
+                saved
+                    .persistent_terminal_ids(workspace_id)
+                    .unwrap()
+                    .contains(&persistent_id)
+            );
+            let database = cx.update(|cx| TerminalDb::global(cx));
+            let before_cleanup = database
+                .get_persistent_center_snapshot(&persistent_id, workspace_id)
+                .unwrap()
+                .expect("terminal snapshot before cleanup");
+            assert_eq!(before_cleanup.1.as_deref(), Some("host round trip"));
+            // Centre cleanup must retain identities still referenced by the saved dock.
+            window_handle
+                .update(cx, |_, window, cx| {
+                    <TerminalView as SerializableItem>::cleanup_with_persistent_item_ids(
+                        workspace_id,
+                        vec![],
+                        vec![],
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(
+                database
+                    .get_persistent_center_snapshot(&persistent_id, workspace_id)
+                    .unwrap()
+                    .expect("terminal snapshot after cleanup")
+                    .1
+                    .as_deref(),
+                Some("host round trip")
+            );
+            terminal_panel.update(cx, |panel, _| panel.restoring = true);
+            window_handle
+                .update(cx, |_, window, cx| {
+                    dock_pane.update(cx, |pane, cx| {
+                        let ids = pane.items().map(|item| item.item_id()).collect::<Vec<_>>();
+                        for id in ids {
+                            pane.remove_item(id, false, false, window, cx);
+                        }
+                    })
+                })
+                .unwrap();
+            let task = window_handle
+                .update(cx, |_, window, cx| {
+                    deserialize_terminal_panel(
+                        workspace.downgrade(),
+                        workspace.read(cx).project().clone(),
+                        workspace_id,
+                        saved,
+                        terminal_panel.downgrade(),
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+            assert_eq!(task.await.unwrap(), 1);
+            let restored = terminal_panel.read_with(cx, |panel, cx| {
+                panel
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .unwrap()
+                    .downcast::<TerminalView>()
+                    .unwrap()
+            });
+            assert_ne!(restored.entity_id(), terminal_view.entity_id());
+            restored.read_with(cx, |view, cx| {
+                assert_eq!(view.persistent_terminal_id.as_ref(), Some(&persistent_id));
+                assert_eq!(view.custom_title(), Some("host round trip"));
+                assert_eq!(view.project_worktree_root(cx), Some(cwd.clone()));
+                assert_eq!(
+                    view.terminal().read(cx).initial_working_directory(),
+                    Some(live_cwd.as_path())
+                );
+                if pending {
+                    assert!(view.resumable_cli_binding.session().is_none());
+                    assert_eq!(
+                        view.resumable_cli_binding.pending_codex_cwd(),
+                        Some(cwd.as_path())
+                    );
+                } else {
+                    assert_eq!(view.resumable_cli_binding.session(), Some(&session));
+                }
+                assert_eq!(
+                    view.resumable_cli_provider(),
+                    Some(ResumableCliProvider::Codex)
+                );
+            });
+            restored
+                .read_with(cx, |view, _| view.terminal().clone())
+                .update(cx, |terminal, _| {
+                    terminal.set_working_directory_for_test(Some(live_cwd.clone()))
+                });
+            terminal_panel.update(cx, |panel, _| panel.restoring = false);
+            dock_pane = terminal_panel.read_with(cx, |panel, _| panel.active_pane.clone());
+            let restored_pane = dock_pane.clone();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace::move_item(
+                        &restored_pane,
+                        &center_pane,
+                        restored.entity_id(),
+                        0,
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.flush_serialization(window, cx)
+                    })
+                })
+                .unwrap()
+                .await;
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |_, cx| {
+                        Workspace::restore_database_layout_for_test(workspace_id, window, cx)
+                    })
+                })
+                .unwrap()
+                .await
+                .unwrap();
+            let restored_center = workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .filter_map(|item| item.downcast::<TerminalView>())
+                    .find(|view| {
+                        view.read(cx).persistent_terminal_id.as_ref() == Some(&persistent_id)
+                    })
+                    .unwrap()
+            });
+            restored_center.read_with(cx, |view, cx| {
+                assert_eq!(view.custom_title(), Some("host round trip"));
+                assert_eq!(view.project_worktree_root(cx), Some(cwd.clone()));
+                assert_eq!(
+                    view.terminal().read(cx).initial_working_directory(),
+                    Some(live_cwd.as_path())
+                );
+                if pending {
+                    assert!(view.resumable_cli_binding.session().is_none());
+                    assert_eq!(
+                        view.resumable_cli_binding.pending_codex_cwd(),
+                        Some(cwd.as_path())
+                    );
+                } else {
+                    assert_eq!(view.resumable_cli_binding.session(), Some(&session));
+                }
+                assert_eq!(
+                    view.resumable_cli_provider(),
+                    Some(ResumableCliProvider::Codex)
+                );
+            });
+            restored_center
+                .read_with(cx, |view, _| view.terminal().clone())
+                .update(cx, |terminal, _| {
+                    terminal.set_working_directory_for_test(Some(live_cwd.clone()))
+                });
+            // The next saved dock layout must describe the new live entity, retaining its stable identity.
+            center_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+            let restored_center_pane = center_pane.clone();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace::move_item(
+                        &restored_center_pane,
+                        &dock_pane,
+                        restored_center.entity_id(),
+                        0,
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    async fn test_moving_terminal_between_center_and_panel_preserves_session_state(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let item = cx.new(|cx| CenterTestItem {
+                        focus_handle: cx.focus_handle(),
+                    });
+                    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+                    TerminalPanel::add_center_terminal(workspace, window, cx, |project, cx| {
+                        project.create_terminal_shell(None, cx)
+                    })
+                })
+            })
+            .expect("Failed to update workspace")
+            .await
+            .expect("Failed to create center terminal");
+        cx.run_until_parked();
+
+        let (center_pane, terminal_view) = window_handle
+            .read_with(cx, |multi_workspace, cx| {
+                let pane = multi_workspace.workspace().read(cx).active_pane().clone();
+                let view = pane
+                    .read(cx)
+                    .active_item()
+                    .and_then(|item| item.downcast::<TerminalView>())
+                    .expect("Center terminal should be active");
+                (pane, view)
+            })
+            .expect("Failed to read center terminal");
+        let session = ResumableCliSession::new(
+            ResumableCliProvider::Codex,
+            "0199a4f5-1fe0-7000-8000-000000000003".to_owned(),
+            if cfg!(windows) {
+                PathBuf::from(r"C:\project-a")
+            } else {
+                PathBuf::from("/project-a")
+            },
+            ResumableCliEvidence::ProviderEvent,
+        )
+        .expect("Valid resumable session");
+        terminal_view.update(cx, |view, cx| {
+            view.set_custom_title(Some("my agent".to_owned()), cx);
+            view.resumable_cli_binding = ResumableCliBinding {
+                pending_codex_cwd: None,
+                revision: 7,
+                session: Some(session.clone()),
+            };
+        });
+        let (terminal_id, persistent_id) = terminal_view.read_with(cx, |view, _| {
+            (
+                view.terminal().entity_id(),
+                view.persistent_terminal_id.clone(),
+            )
+        });
+        assert!(persistent_id.is_some());
+        let dock_pane = terminal_panel.read_with(cx, |panel, _| panel.active_pane.clone());
+        let background_item = center_pane.read_with(cx, |pane, _| {
+            pane.items_of_type::<CenterTestItem>()
+                .next()
+                .expect("Unrelated center item")
+        });
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_panel::<TerminalPanel>(window, cx);
+                });
+            })
+            .expect("Open terminal dock");
+        cx.run_until_parked();
+
+        for (source, destination) in [
+            (center_pane.clone(), dock_pane.clone()),
+            (dock_pane.clone(), center_pane.clone()),
+        ] {
+            window_handle
+                .update(cx, |multi_workspace, window, cx| {
+                    window.activate_window();
+                    multi_workspace.workspace().update(cx, |workspace, cx| {
+                        workspace.activate_item(&background_item, true, true, window, cx);
+                    });
+                })
+                .expect("Prepare background terminal");
+            cx.run_until_parked();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    assert!(window.is_window_active());
+                    assert!(!terminal_view.read(cx).focus_handle(cx).is_focused(window));
+                    assert!(background_item.read(cx).focus_handle(cx).is_focused(window));
+                })
+                .expect("Verify background terminal focus");
+            terminal_view
+                .read_with(cx, |view, _| view.terminal().clone())
+                .update(cx, |_, cx| cx.emit(terminal::Event::Bell));
+            cx.run_until_parked();
+            assert!(terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+            window_handle
+                .update(cx, |_, window, cx| {
+                    workspace::move_item(
+                        &source,
+                        &destination,
+                        terminal_view.entity_id(),
+                        destination.read(cx).items_len(),
+                        false,
+                        window,
+                        cx,
+                    );
+                })
+                .expect("Failed to move terminal");
+            cx.run_until_parked();
+            assert!(terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+            window_handle
+                .update(cx, |_, window, cx| {
+                    destination.update(cx, |pane, cx| {
+                        let index = pane.index_for_item(&terminal_view).expect("Moved terminal");
+                        pane.activate_item(index, true, true, window, cx);
+                    });
+                })
+                .expect("Focus moved terminal");
+            cx.run_until_parked();
+            window_handle
+                .update(cx, |_, window, cx| {
+                    assert!(terminal_view.read(cx).focus_handle(cx).is_focused(window));
+                })
+                .expect("Verify moved terminal content focus");
+            assert!(!terminal_view.read_with(cx, |view, cx| view.is_dirty(cx)));
+
+            let moved = destination
+                .read_with(cx, |pane, _| {
+                    pane.items()
+                        .filter_map(|item| item.downcast::<TerminalView>())
+                        .find(|view| view.entity_id() == terminal_view.entity_id())
+                })
+                .expect("Moved terminal should remain in destination");
+            assert_eq!(moved, terminal_view);
+            assert!(source.read_with(cx, |pane, _| {
+                pane.items()
+                    .all(|item| item.item_id() != terminal_view.entity_id())
+            }));
+            terminal_view.read_with(cx, |view, _| {
+                assert_eq!(view.terminal().entity_id(), terminal_id);
+                assert_eq!(view.persistent_terminal_id, persistent_id);
+                assert_eq!(view.custom_title(), Some("my agent"));
+                assert_eq!(view.resumable_cli_binding.revision(), 7);
+                assert_eq!(view.resumable_cli_binding.session(), Some(&session));
+            });
+        }
     }
 
     #[gpui::test]
@@ -3365,6 +4455,165 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             crate::init(cx);
+        });
+    }
+    #[gpui::test]
+    async fn test_dock_layout_flushes_pending_terminal_state_before_publication(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        cx.update(|cx| cx.set_global(AppDatabase::test_new()));
+        init_test(cx);
+        let workspace_id = cx
+            .update(|cx| WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let (window_handle, panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let root = std::env::current_dir().unwrap();
+        let outside = std::env::temp_dir();
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let fs = project.read_with(cx, |project, _| project.fs().clone());
+        fs.as_fake().insert_tree(&root, serde_json::json!({})).await;
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(&root, true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        workspace.update(cx, |workspace, _| {
+            workspace.set_database_id_for_test(workspace_id)
+        });
+        let view = window_handle
+            .update(cx, |_, window, cx| {
+                let terminal = cx.new(|cx| {
+                    let builder = terminal::TerminalBuilder::new_display_only(
+                        terminal::terminal_settings::CursorShape::default(),
+                        terminal::terminal_settings::AlternateScroll::On,
+                        None,
+                        0,
+                        cx.background_executor(),
+                        util::paths::PathStyle::local(),
+                    )
+                    .with_initial_working_directory(Some(root.clone()));
+                    let mut terminal = builder.subscribe(cx);
+                    terminal.set_working_directory_for_test(Some(root.clone()));
+                    terminal
+                });
+                let view = cx.new(|cx| {
+                    TerminalView::new(
+                        terminal,
+                        workspace.downgrade(),
+                        Some(workspace_id),
+                        project.downgrade(),
+                        window,
+                        cx,
+                    )
+                });
+                let pane = panel.read(cx).active_pane.clone();
+                pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(view.clone()), true, false, None, window, cx)
+                });
+                view
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        let initial_snapshot = window_handle
+            .update(cx, |_, _, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    view.update(cx, |view, cx| {
+                        view.serialize(workspace, cx.entity_id().as_u64(), false, cx)
+                    })
+                })
+            })
+            .unwrap();
+        if let Some(snapshot) = initial_snapshot {
+            snapshot.await.unwrap();
+        }
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| view.terminal().clone())
+            .update(cx, |terminal, _| {
+                terminal.set_working_directory_for_test(Some(outside.clone()))
+            });
+        // Leave the ordinary item worker idle so the panel save must flush the pending snapshot.
+        view.update(cx, |view, _| {
+            view.custom_title = Some("pending dock state".into());
+            view.needs_serialize = true;
+            view.persistence_generation = view.persistence_generation.wrapping_add(1);
+        });
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        panel
+            .update(cx, |panel, _| {
+                std::mem::replace(&mut panel.pending_serialization, Task::ready(None))
+            })
+            .await;
+        let database = cx.update(|cx| TerminalDb::global(cx));
+        let item_id = view.entity_id().as_u64();
+        assert_eq!(
+            database
+                .get_custom_title(item_id, workspace_id)
+                .unwrap()
+                .as_deref(),
+            Some("pending dock state")
+        );
+        assert_eq!(
+            database
+                .get_working_directory(item_id, workspace_id)
+                .unwrap(),
+            Some(outside.clone())
+        );
+        assert_eq!(
+            database
+                .project_worktree_association(item_id, workspace_id)
+                .unwrap(),
+            crate::persistence::ProjectWorktreeAssociation::Recorded(Some(root.clone()))
+        );
+        let key = workspace.read_with(cx, |workspace, _| {
+            TerminalPanel::serialization_key(workspace).unwrap()
+        });
+        let saved = cx
+            .update(|cx| KeyValueStore::global(cx))
+            .read_kvp(&key)
+            .unwrap()
+            .unwrap();
+        let saved = serde_json::from_str(&saved).unwrap();
+        window_handle
+            .update(cx, |_, window, cx| {
+                deserialize_terminal_panel(
+                    workspace.downgrade(),
+                    project.clone(),
+                    workspace_id,
+                    saved,
+                    panel.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        panel.read_with(cx, |panel, cx| {
+            let restored = panel
+                .active_pane
+                .read(cx)
+                .active_item()
+                .unwrap()
+                .downcast::<TerminalView>()
+                .unwrap();
+            let restored = restored.read(cx);
+            assert_eq!(restored.custom_title(), Some("pending dock state"));
+            assert_eq!(restored.project_worktree_root(cx), Some(root));
+            assert_eq!(
+                restored.terminal().read(cx).initial_working_directory(),
+                Some(outside.as_path())
+            );
         });
     }
 }

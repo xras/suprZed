@@ -925,7 +925,8 @@ mod linux {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Zed {}{}{} – {}",
+                "suprZed {}\nZed {}{}{} – {}",
+                env!("SUPRZED_VERSION"),
                 if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                     "".to_string()
                 } else {
@@ -1202,7 +1203,8 @@ mod windows {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Zed {}{}{} – {}",
+                "suprZed {}\nZed {}{}{} – {}",
+                env!("SUPRZED_VERSION"),
                 if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                     "".to_string()
                 } else {
@@ -1276,7 +1278,12 @@ mod windows {
 
                 // ../Zed.exe is the standard, lib/zed is for MSYS2, ./zed.exe is for the target
                 // directory in development builds.
-                let possible_locations = ["../Zed.exe", "../lib/zed/zed-editor.exe", "./zed.exe"];
+                let possible_locations = [
+                    "./suprZed.exe",
+                    "../Zed.exe",
+                    "../lib/zed/zed-editor.exe",
+                    "./zed.exe",
+                ];
                 possible_locations
                     .iter()
                     .find_map(|p| dir.join(p).canonicalize().ok().filter(|path| path != &cli))
@@ -1375,7 +1382,12 @@ mod mac_os {
 
     impl InstalledApp for Bundle {
         fn zed_version_string(&self) -> String {
-            format!("Zed {} – {}", self.version(), self.path().display(),)
+            format!(
+                "suprZed {}\nZed {} – {}",
+                env!("SUPRZED_VERSION"),
+                self.version(),
+                self.path().display()
+            )
         }
 
         fn launch(&self, url: String, user_data_dir: Option<&str>) -> anyhow::Result<()> {

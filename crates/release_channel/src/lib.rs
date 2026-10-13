@@ -7,6 +7,9 @@ use std::{env, str::FromStr, sync::LazyLock};
 use gpui::{App, Global};
 use semver::Version;
 
+mod suprzed_version;
+pub use suprzed_version::{BuildOrigin, SourceStatus, SuprZedVersion};
+
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
 /// stable | dev | nightly | preview

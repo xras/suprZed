@@ -84,7 +84,11 @@ impl PlatformTitleBar {
     }
 
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        if self.platform_style == PlatformStyle::Windows
+            && cx.theme().appearance() == theme::Appearance::Dark
+        {
+            gpui::rgba(0x171a1cff).into()
+        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background
             } else {
@@ -209,6 +213,9 @@ impl Render for PlatformTitleBar {
         let decorations = window.window_decorations();
         let height = platform_title_bar_height(window);
         let titlebar_color = self.title_bar_color(window, cx);
+        let dark_windows_title_bar = self.platform_style == PlatformStyle::Windows
+            && cx.theme().appearance() == theme::Appearance::Dark;
+        let titlebar_border_color = cx.theme().colors().border;
         let close_action = Box::new(workspace::CloseWindow);
         let children = mem::take(&mut self.children);
 
@@ -216,6 +223,7 @@ impl Render for PlatformTitleBar {
         let sidebar = self.sidebar_render_state(cx);
 
         let title_bar = h_flex()
+            .relative()
             .window_control_area(WindowControlArea::Drag)
             .w_full()
             .h(height)
@@ -348,7 +356,18 @@ impl Render for PlatformTitleBar {
                         title_bar
                     }
                 },
-            );
+            )
+            .when(dark_windows_title_bar, |title_bar| {
+                title_bar.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(1.))
+                        .bg(titlebar_border_color),
+                )
+            });
 
         v_flex()
             .w_full()
